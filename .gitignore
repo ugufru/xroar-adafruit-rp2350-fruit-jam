@@ -1,0 +1,6 @@
+# Local reference copy of the Adafruit Fruit Jam guide (26 MB) — see README for the online link
+adafruit-fruit-jam.pdf
+
+# macOS
+.DS_Store
+._*
