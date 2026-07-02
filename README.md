@@ -34,9 +34,11 @@ XRoar emulates. That makes it a natural CoCo.
 Sources: the [Adafruit Fruit Jam learn guide](https://learn.adafruit.com/adafruit-fruit-jam)
 (a PDF snapshot, `adafruit-fruit-jam.pdf`, is kept locally in this directory but not committed)
 and the [product page](https://www.adafruit.com/product/6200). Note: the board is the A2 stepping
-of the RP2350, so the **E9 erratum** (GPIO input leakage) applies. One inconsistency spotted in
-the guide: its SD pin listing gives GPIO34 for both SD_SCK and SD_CARD_DETECT — the card-detect
-pin needs verifying against the schematic.
+of the RP2350, so the **E9 erratum** (GPIO input leakage) applies. The full verified pin map is in
+[`docs/hardware-pinout.md`](docs/hardware-pinout.md) (FRUITJAM-01). It resolved the guide's
+one internal contradiction — the SD pin listing gives GPIO34 for both SD_SCK and SD_CARD_DETECT —
+against the schematic: **card-detect is GPIO33** (GPIO34 is SD_SCK), and the otherwise-unlisted
+**PSRAM chip-select is GPIO47**.
 
 ## Why this board is interesting for XRoar
 
