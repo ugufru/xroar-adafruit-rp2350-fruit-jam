@@ -1,0 +1,14 @@
+{
+  "name": "pico_hdmi",
+  "version": "0.0.7",
+  "description": "HSTX-native HDMI/DVI output for the RP2350 (vendored, Unlicense). See PROVENANCE.md.",
+  "keywords": ["hstx", "hdmi", "dvi", "rp2350"],
+  "license": "Unlicense",
+  "frameworks": "arduino",
+  "platforms": "raspberrypi",
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include",
+    "srcFilter": "+<*> -<video_output_rt.c>"
+  }
+}
