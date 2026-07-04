@@ -1,0 +1,19 @@
+{
+  "name": "coco_machine",
+  "version": "0.1.0",
+  "description": "Hand-written Tandy CoCo 1/2 machine glue over the vendored XRoar 1.11 chip modules (FRUITJAM-22). Wires mc6809 + mc6883 SAM + 2x mc6821 PIA + mc6847 VDG into a runnable machine. Depends on lib/xroar_core.",
+  "license": "GPL-3.0-or-later",
+  "dependencies": {
+    "xroar_core": "*"
+  },
+  "build": {
+    "srcDir": "src",
+    "flags": [
+      "-I../xroar_core/include",
+      "-I../xroar_core/src",
+      "-I../xroar_core/src/mc6809",
+      "-I../xroar_core/src/mc6847",
+      "-I../xroar_core/portalib"
+    ]
+  }
+}
