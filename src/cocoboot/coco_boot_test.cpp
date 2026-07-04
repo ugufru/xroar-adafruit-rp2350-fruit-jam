@@ -59,6 +59,25 @@ static void dump_screen_row(int row) {
     Serial.println("\"");
 }
 
+// FRUITJAM-24 proof: reconstruct the rendered indexed frame as ASCII art.
+// The frame is nibble-packed (2 palette indices/byte). BASIC text renders
+// black-on-green, so ink = PAL_BLACK (index 8), paper = PAL_GREEN (index 0):
+// print '#' for ink, ' ' for paper — the glyphs become directly legible.
+static void dump_vdg_art(int y0, int y1, int width) {
+    const uint8_t *fb = coco_machine_get_vdg_buffer();
+    for (int y = y0; y < y1; y++) {
+        const uint8_t *row = &fb[y * (256 / 2)];
+        char line[257];
+        int n = 0;
+        for (int x = 0; x < width && x < 256; x++) {
+            uint8_t idx = (x & 1) ? (row[x >> 1] >> 4) : (row[x >> 1] & 0x0F);
+            line[n++] = (idx == 8 /*PAL_BLACK ink*/) ? '#' : ' ';
+        }
+        line[n] = 0;
+        Serial.printf("  |%s|\n", line);
+    }
+}
+
 static void run_boot_test() {
     Serial.println();
     Serial.println("=== FRUITJAM-22 CoCo machine headless boot ===");
@@ -96,6 +115,11 @@ static void run_boot_test() {
 
     Serial.println("Text page $0400 (first 4 rows):");
     for (int r = 0; r < 4; r++) dump_screen_row(r);
+
+    // FRUITJAM-24: render the indexed frame and show it as pixel art.
+    coco_machine_render_frame();
+    Serial.println("Rendered VDG frame (text rows 0-2, first 128 px; '#'=ink):");
+    dump_vdg_art(0, 36, 128);
 
     bool pc_in_rom = (pc >= 0xA000 && pc <= 0xBFFF);
     bool irq_alive = (irqs >= 100);   // expect ~120 over 2 s

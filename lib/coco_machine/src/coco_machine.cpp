@@ -318,10 +318,164 @@ extern "C" void coco_machine_run_cycles(uint32_t cycles) {
     g_m.cpu->run(g_m.cpu);
 }
 
-// - - - frame renderer (stub — FRUITJAM-24 implements) ------------------------
-extern "C" void coco_machine_render_frame(void) {
-    // FRUITJAM-24 will regenerate vdg_buffer from PIA1 PB mode + SAM F + RAM.
-    // Until then, leave the buffer as-is (all-black at init).
+// - - - frame renderer (FRUITJAM-24) ------------------------------------------
+//
+// Frame-batched, palette-LUT VDG renderer. Once per field the presentation side
+// calls coco_machine_render_frame(), which reads PIA1 PB (mode bits) + the SAM F
+// display base + CoCo RAM and regenerates the whole nibble-packed vdg_buffer.
+// This replaces XRoar's per-scanline render_line path (which we no-op), the
+// ~2x-cheaper approach from COCO-47/AMOLED-57.
+//
+// Palette indices below are the contract with the presentation layer's RGB565
+// table (FRUITJAM-25). Keep the two in lockstep.
+
+extern "C" const uint8_t font_6847t1[];   // 128 glyphs x 12 rows
+
+#define PAL_GREEN       0
+#define PAL_YELLOW      1
+#define PAL_BLUE        2
+#define PAL_RED         3
+#define PAL_WHITE       4
+#define PAL_CYAN        5
+#define PAL_MAGENTA     6
+#define PAL_ORANGE      7
+#define PAL_BLACK       8
+#define PAL_DARK_GREEN  9
+
+// Vertical replication (display scanlines per data row) for graphics GM 0..7.
+static const uint8_t GM_nLPR[8] = { 3, 3, 3, 2, 2, 1, 1, 1 };
+
+static inline void put2(uint8_t *dst, int px, uint8_t color) {
+    int b = px >> 1;
+    if (px & 1) dst[b] = (dst[b] & 0x0F) | (uint8_t)(color << 4);
+    else        dst[b] = (dst[b] & 0xF0) | color;
+}
+
+// Precomputed expansion of an 8-px font row into the 4 packed vdg_buffer bytes,
+// for the two BASIC text colourings (one 32-bit store replaces 8 put2 calls):
+//   [0] normal  green-on-black   (ink=GREEN,  paper=BLACK)
+//   [1] inverse black-on-green   (ink=BLACK,  paper=GREEN)   <- the iconic look
+static uint32_t g_alpha_lut[2][256];
+static bool     g_alpha_lut_ready = false;
+
+static void build_alpha_lut(void) {
+    const uint8_t combos[2][2] = { { PAL_GREEN, PAL_BLACK }, { PAL_BLACK, PAL_GREEN } };
+    for (int c = 0; c < 2; c++) {
+        uint8_t ink = combos[c][0], paper = combos[c][1];
+        for (int g = 0; g < 256; g++) {
+            uint32_t word = 0;
+            for (int bit = 0; bit < 8; bit++) {
+                uint8_t color = (g & (0x80 >> bit)) ? ink : paper;
+                int byte = bit >> 1, shift = (bit & 1) ? 4 : 0;   // low nibble = even px
+                word |= (uint32_t)color << (byte * 8 + shift);
+            }
+            g_alpha_lut[c][g] = word;
+        }
+    }
+    g_alpha_lut_ready = true;
+}
+
+// Alphanumeric + SG4 semigraphics. 32 cols x 16 rows, each glyph 8x12.
+static void HOT_FUNC(render_alpha_frame)(uint16_t base) {
+    if (!g_alpha_lut_ready) build_alpha_lut();
+    for (int text_row = 0; text_row < 16; text_row++) {
+        for (int sub = 0; sub < 12; sub++) {
+            int row = text_row * 12 + sub;
+            if (row >= COCO_VDG_H) return;
+            uint8_t *dst = &g_m.vdg_buffer[row * (COCO_VDG_W / 2)];
+            const uint8_t *cells = &g_ram[(uint16_t)(base + text_row * 32)];
+            for (int col = 0; col < 32; col++) {
+                uint8_t ch = cells[col];
+                if (ch & 0x80) {
+                    // SG4: 2x2 colour block, colour = bits 6..4, pattern = bits 3..0.
+                    uint8_t color = (ch >> 4) & 7;
+                    uint8_t sg = (sub < 6) ? (ch >> 2) : ch;   // top vs bottom half
+                    uint8_t left  = (sg & 2) ? color : PAL_BLACK;
+                    uint8_t right = (sg & 1) ? color : PAL_BLACK;
+                    int bp = col * 8;
+                    for (int b = 0; b < 8; b++) put2(dst, bp + b, (b < 4) ? left : right);
+                } else {
+                    // Alpha: bit 6 = inverse. Glyph index (ch & 0x3F) | 0x40.
+                    uint8_t glyph = font_6847t1[(((ch & 0x3F) | 0x40)) * 12 + sub];
+                    *(uint32_t *)(dst + col * 4) = g_alpha_lut[(ch >> 6) & 1][glyph];
+                }
+            }
+        }
+    }
+}
+
+// Colour / resolution graphics, GM 0..6 (RG6/GM7 has its own path below).
+// RG modes: 1 bit/pixel fg/bg. CG modes: 2 bits/pixel, colour = cg_base + value.
+static void HOT_FUNC(render_graphics_frame)(uint16_t base, uint8_t gm, bool css) {
+    const bool is_32       = (gm == 2 || gm == 4 || gm == 6);
+    const int  bytes_per_row = is_32 ? 32 : 16;
+    const int  nlpr        = GM_nLPR[gm];
+    const bool rg          = gm & 1;
+    const int  data_rows   = COCO_VDG_H / nlpr;
+
+    const uint8_t cg_base = css ? PAL_WHITE : PAL_GREEN;
+    const uint8_t fg = css ? PAL_WHITE : PAL_GREEN;
+    const uint8_t bg = css ? PAL_BLACK : PAL_DARK_GREEN;
+
+    const int src_px = rg ? bytes_per_row * 8 : bytes_per_row * 4;
+    const int hrep   = COCO_VDG_W / src_px;
+
+    static uint8_t rowbuf[COCO_VDG_W];
+    for (int drow = 0; drow < data_rows; drow++) {
+        const uint8_t *p = &g_ram[(uint16_t)(base + drow * bytes_per_row)];
+        int px = 0;
+        for (int byte = 0; byte < bytes_per_row; byte++) {
+            uint8_t b = p[byte];
+            if (rg) {
+                for (int bit = 0; bit < 8; bit++) {
+                    uint8_t c = (b & (0x80 >> bit)) ? fg : bg;
+                    for (int r = 0; r < hrep; r++) rowbuf[px++] = c;
+                }
+            } else {
+                for (int cell = 0; cell < 4; cell++) {
+                    uint8_t c = cg_base + ((b >> 6) & 3);
+                    b <<= 2;
+                    for (int r = 0; r < hrep; r++) rowbuf[px++] = c;
+                }
+            }
+        }
+        for (int rep = 0; rep < nlpr; rep++) {
+            int disp = drow * nlpr + rep;
+            if (disp >= COCO_VDG_H) break;
+            uint8_t *dst = &g_m.vdg_buffer[disp * (COCO_VDG_W / 2)];
+            for (int x = 0; x < COCO_VDG_W; x += 2)
+                dst[x >> 1] = rowbuf[x] | (rowbuf[x + 1] << 4);
+        }
+    }
+}
+
+// RG6 / PMODE 4: 1 bit/pixel, 256x192 mono. NTSC artifact colour is a later
+// refinement (its phase is power-on-arbitrary — a FRUITJAM polish item); render
+// plain white-on-black for now.
+static void HOT_FUNC(render_rg6_frame)(uint16_t base) {
+    for (int row = 0; row < COCO_VDG_H; row++) {
+        const uint8_t *src = &g_ram[(uint16_t)(base + row * 32)];
+        uint8_t *dst = &g_m.vdg_buffer[row * (COCO_VDG_W / 2)];
+        for (int byte = 0; byte < 32; byte++) {
+            uint8_t b = src[byte];
+            for (int bit = 0; bit < 8; bit++)
+                put2(dst, byte * 8 + bit, (b & (0x80 >> bit)) ? PAL_WHITE : PAL_BLACK);
+        }
+    }
+}
+
+extern "C" void HOT_FUNC(coco_machine_render_frame)(void) {
+    if (!g_m.pia1) return;
+    const uint8_t  pb   = (g_m.pia1->b.out_source & g_m.pia1->b.out_sink) & 0xFF;
+    const uint16_t base = g_m.sam_f ? g_m.sam_f : 0x0400;
+    const uint8_t  gm   = (pb >> 4) & 7;
+    const bool     css  = (pb & 0x08) != 0;
+    if (pb & 0x80) {                     // ¬A/G set -> graphics
+        if (gm == 7) render_rg6_frame(base);
+        else         render_graphics_frame(base, gm, css);
+    } else {                             // alpha + SG4
+        render_alpha_frame(base);
+    }
 }
 
 // - - - accessors -------------------------------------------------------------
