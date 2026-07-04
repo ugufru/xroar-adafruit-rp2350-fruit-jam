@@ -1,0 +1,32 @@
+{
+  "name": "xroar_core",
+  "version": "0.1.0",
+  "description": "Vendored XRoar 1.11 CPU/SAM/VDG/PIA modules + portalib (FRUITJAM-09). Core files are a verbatim tag-1.11 extraction; only include/, xroar_stubs.c and the stub xroar.h/logging.h are hand-authored glue. See PROVENANCE / issue FRUITJAM-09.",
+  "license": "GPL-3.0-or-later",
+  "build": {
+    "srcDir": ".",
+    "srcFilter": [
+      "+<src/*.c>",
+      "+<src/mc6809/mc6809.c>",
+      "+<src/mc6847/*.c>",
+      "-<src/mc6847/font-6847.c>",
+      "+<portalib/*.c>",
+      "-<portalib/sdsx.c>",
+      "-<portalib/c-ctype.c>",
+      "-<portalib/c-strcasecmp.c>",
+      "-<portalib/c-strncasecmp.c>",
+      "-<portalib/intfuncs.c>",
+      "-<portalib/strnlen.c>",
+      "-<portalib/strsep.c>",
+      "-<src/mc680x/>"
+    ],
+    "includeDir": "src",
+    "flags": [
+      "-Iinclude",
+      "-Isrc",
+      "-Isrc/mc6809",
+      "-Isrc/mc6847",
+      "-Iportalib"
+    ]
+  }
+}

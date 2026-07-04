@@ -20,3 +20,13 @@ third-party code. See `PROVENANCE.md` for exact versions and commits.
 
 The Unlicense places the code in the public domain, so it is compatible with
 this project's GPL-3.0-or-later license.
+
+---
+
+## lib/xroar_core — XRoar emulation core
+
+**GPL-3.0-or-later** — the same license as this project (this repo is a port of
+XRoar). Copyright © Ciaran Anscomb and contributors. Upstream:
+https://www.6809.org.uk/xroar/ ; full license text in upstream `COPYING.GPL`.
+Vendored from release tag `1.11`; see `PROVENANCE.md` for the exact commit and
+the single documented portability edit.
