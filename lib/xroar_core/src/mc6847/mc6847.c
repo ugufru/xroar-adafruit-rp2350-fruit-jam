@@ -413,6 +413,18 @@ static void do_hs_rise(void *data) {
 // Renders current scanline up to the current time.
 
 static void render_scanline(struct MC6847_private *vdg) {
+#ifdef SUPPRESS_RENDER_SCANLINE
+	// RP2350 port (FRUITJAM-23): skip the per-scanline pixel pipeline. The VDG
+	// state machine in do_hs_fall still advances the scanline/row counters and
+	// the A pointer and fires signal_hs / signal_fs, so HS/FS timing and the
+	// 60 Hz IRQ are preserved — only the pixel fetch/pack is dropped. The port
+	// regenerates the frame in one batch from RAM instead (COCO-47/AMOLED-57),
+	// reclaiming ~2x. This is the second documented deviation from verbatim
+	// tag-1.11 (see PROVENANCE.md); it changes nothing unless the build defines
+	// SUPPRESS_RENDER_SCANLINE.
+	(void)vdg;
+	return;
+#endif
 	// Calculate where we are in the scanline, and queue video data up to
 	// this point in time.
 

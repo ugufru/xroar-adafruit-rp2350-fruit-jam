@@ -47,7 +47,7 @@ repo, so the lineage stays auditable. See `THIRD_PARTY_LICENSES.md` for licenses
   mc6821 (PIA), events, part, ram, clock, serialise, and a portalib subset
   (delegate, slist, sds, xmalloc, pl-string, etc.).
 
-### The one authorized deviation from verbatim 1.11
+### Authorized deviations from verbatim 1.11
 - **`src/serialise.h`** — added `default: ser_type_unhandled` to the *inner*
   `_Generic` in the `ser_type_for(m)` macro, with an `RP2350 port:` comment.
   Rationale: the arm-none-eabi/newlib toolchain type-checks every association of
@@ -56,7 +56,16 @@ repo, so the lineage stays auditable. See `THIRD_PARTY_LICENSES.md` for licenses
   inner associations, so upstream 1.11's defaultless inner `_Generic` is
   ill-formed here. `ser_type_unhandled` is already upstream's designed
   "returns control to caller" escape value, so this is semantically safe and
-  minimal. This is the **only** content change to any extracted core file.
+  minimal.
+- **`src/mc6847/mc6847.c`** (FRUITJAM-23) — added an `#ifdef SUPPRESS_RENDER_SCANLINE`
+  guard at the top of `render_scanline()` that early-returns, skipping the
+  per-scanline pixel fetch/pack. The VDG state machine (`do_hs_fall`) still
+  advances the scanline/row counters and fires `signal_hs`/`signal_fs`, so HS/FS
+  timing and the 60 Hz IRQ are unaffected; the port regenerates each frame in one
+  batch from RAM instead (~2x reclaim, COCO-47/AMOLED-57). Inert unless the build
+  defines `SUPPRESS_RENDER_SCANLINE` (the `[env:coco]` build does).
+
+These are the **only** content changes to any extracted core file.
 
 ### Port glue authored for this repo (NOT from upstream core)
 These are build scaffolding, modeled on the prior-port pattern — not emulation
