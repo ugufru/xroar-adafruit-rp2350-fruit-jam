@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // coco_machine — hand-written CoCo 1/2 integration glue (FRUITJAM-22).
 //
 // Wires the vendored XRoar 1.11 chip modules (mc6809 CPU, mc6883 SAM,

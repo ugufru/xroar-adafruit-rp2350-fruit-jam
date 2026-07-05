@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // xroar-adafruit-rp2350-fruit-jam — microSD bring-up test (FRUITJAM-06).
 //
 // Proves the SD path end to end: mount a FAT32 card over SPI0, list the root

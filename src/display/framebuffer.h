@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // 320x240 RGB565 framebuffer + a bring-up test pattern.
 // FRUITJAM-04. Header-only, driver-agnostic: the HSTX scanout (whichever
 // option we choose) reads this buffer and doubles it to 640x480.

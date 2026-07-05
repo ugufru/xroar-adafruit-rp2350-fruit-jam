@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // coco_machine.cpp — see coco_machine.h. FRUITJAM-22.
 //
 // Owns: 64 KB RAM (SRAM, per COCO-41 — never PSRAM in the hot path), the ROM

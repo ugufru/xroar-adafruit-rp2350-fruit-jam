@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // xroar-adafruit-rp2350-fruit-jam — clock-plan probe (FRUITJAM-03).
 //
 // Diagnostic build (env:clockprobe). Validates the 252 MHz clock plan from

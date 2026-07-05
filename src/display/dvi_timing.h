@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // 640x480p60 DVI timing — VESA DMT / CEA standard VGA polarity.
 // FRUITJAM-04. See docs/display-hstx.md for the derivation.
 //

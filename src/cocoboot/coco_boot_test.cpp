@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // xroar-adafruit-rp2350-fruit-jam — headless CoCo boot test (FRUITJAM-22).
 //
 // Proves the hand-written coco_machine glue boots Color BASIC on real silicon,

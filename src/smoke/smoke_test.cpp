@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // xroar-adafruit-rp2350-fruit-jam — headless XRoar-core smoke test (FRUITJAM-09).
 //
 // Acceptance: execute N MC6809 cycles of the Color BASIC 1.2 ROM headless and

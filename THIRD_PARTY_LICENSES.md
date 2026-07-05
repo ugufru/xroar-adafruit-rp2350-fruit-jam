@@ -29,4 +29,15 @@ this project's GPL-3.0-or-later license.
 XRoar). Copyright © Ciaran Anscomb and contributors. Upstream:
 https://www.6809.org.uk/xroar/ ; full license text in upstream `COPYING.GPL`.
 Vendored from release tag `1.11`; see `PROVENANCE.md` for the exact commit and
-the single documented portability edit.
+the two documented portability edits (`serialise.h` `_Generic`, `mc6847.c`
+`SUPPRESS_RENDER_SCANLINE`).
+
+---
+
+## carlk3/no-OS-FatFS-SD-SDIO-SPI-RPi-Pico — SD/FatFs driver (build dependency)
+
+**Apache-2.0.** Pulled at build time via PlatformIO `lib_deps` (not vendored into
+this repo, so its sources are not redistributed here). Our `src/sd/hw_config.c`
+is the board pin-map config for that driver, adapted from its example template;
+it carries this project's GPL-3.0-or-later header. Apache-2.0 is one-way
+compatible with GPL-3.0-or-later.

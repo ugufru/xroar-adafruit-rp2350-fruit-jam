@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * microSD hardware configuration for the Adafruit Fruit Jam (FRUITJAM-06).
  * carlk3 no-OS-FatFS-SD-SDIO-SPI-RPi-Pico, SPI mode.

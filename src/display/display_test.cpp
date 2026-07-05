@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // xroar-adafruit-rp2350-fruit-jam — HSTX DVI test pattern (FRUITJAM-04).
 //
 // First light on the DVI port: a 640x480p60 signal carrying our SMPTE color-bar

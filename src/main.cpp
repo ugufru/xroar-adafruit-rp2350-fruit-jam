@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // xroar-adafruit-rp2350-fruit-jam — bring-up scaffold (FRUITJAM-02).
 //
 // The very first thing that runs on the board: no XRoar yet. It proves the
