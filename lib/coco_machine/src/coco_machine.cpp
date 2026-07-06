@@ -305,6 +305,15 @@ extern "C" _Bool coco_machine_init(const uint8_t *rom, size_t rom_len) {
     return 1;
 }
 
+extern "C" void coco_machine_reset(void) {
+    if (!g_m.cpu) return;
+    // Re-assert RESET: the CPU re-reads the reset vector next run and restarts
+    // Color BASIC. RAM is left intact (authentic warm reset). BASIC re-inits the
+    // SAM/PIA/VDG itself as it boots. Also release any stuck keys.
+    coco_machine_release_all_keys();
+    g_m.cpu->reset(g_m.cpu);
+}
+
 extern "C" void coco_machine_run_cycles(uint32_t cycles) {
     if (!g_m.cpu) return;
 

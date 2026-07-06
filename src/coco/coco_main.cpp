@@ -23,12 +23,15 @@
 #include "hardware/dma.h"
 #include "hardware/structs/bus_ctrl.h"
 #include "pico/stdlib.h"
+#include "pio_usb.h"
+#include "Adafruit_TinyUSB.h"
 
 extern "C" {
 #include "pico_hdmi/video_output.h"
 #include "ff.h"
 #include "f_util.h"
 #include "coco_machine.h"
+#include "dkbd.h"          // DSCAN_* CoCo keyboard scancodes
 }
 
 // Public in pico_hdmi's video_output.c but not its header: full HSTX+DMA restart
@@ -67,7 +70,6 @@ static uint16_t g_pal[16] = {
 // buffering would be tear-free but two 150 KB buffers overflow SRAM; the
 // residual blit/scanout tearing is a FRUITJAM-11/23 refinement.
 static dvi::Framebuffer g_fb;
-static volatile bool    g_video_ready = false;
 static uint8_t          g_rom[16384];
 
 // pico_hdmi 2.0-beta precomposed/native scanout ring (README "Minimal pattern").
@@ -125,10 +127,122 @@ static size_t load_rom(const char *path) {
     return br;
 }
 
+// - - - USB HID keyboard -> CoCo matrix (FRUITJAM-12) --------------------------
+// PIO-USB host behind the CH334F hub (proven in FRUITJAM-05). Reports are diffed
+// per frame and driven into the machine's PIA0 matrix via coco_machine_press/
+// release_key. Implemented fresh; the mapping knowledge is ported from pizero.
+#define HOST_PIN_DP 1
+#define USB_5V_EN   11
+
+static Adafruit_USBH_Host USBHost;
+
+// HID boot-keyboard usage code -> CoCo DSCAN. 0xFF = no mapping.
+static uint8_t g_hid_to_dscan[256];
+
+static void hid_map_init(void) {
+    memset(g_hid_to_dscan, 0xFF, sizeof(g_hid_to_dscan));
+    for (int i = 0; i < 26; i++) g_hid_to_dscan[0x04 + i] = (uint8_t)(DSCAN_A + i);  // a-z
+    static const uint8_t digit[10] = {              // HID 0x1E..0x27 = 1..9,0
+        DSCAN_1, DSCAN_2, DSCAN_3, DSCAN_4, DSCAN_5,
+        DSCAN_6, DSCAN_7, DSCAN_8, DSCAN_9, DSCAN_0 };
+    for (int i = 0; i < 10; i++) g_hid_to_dscan[0x1E + i] = digit[i];
+    g_hid_to_dscan[0x28] = DSCAN_ENTER;     // Enter
+    g_hid_to_dscan[0x29] = DSCAN_BREAK;     // Esc  -> BREAK
+    g_hid_to_dscan[0x2A] = DSCAN_LEFT;      // Backspace -> Left (CoCo rubout)
+    g_hid_to_dscan[0x2B] = DSCAN_RIGHT;     // Tab -> Right
+    g_hid_to_dscan[0x2C] = DSCAN_SPACE;     // Space
+    g_hid_to_dscan[0x2D] = DSCAN_MINUS;     // -
+    g_hid_to_dscan[0x33] = DSCAN_SEMICOLON; // ;
+    g_hid_to_dscan[0x34] = DSCAN_COLON;     // ' -> : (CoCo has a dedicated colon)
+    g_hid_to_dscan[0x36] = DSCAN_COMMA;     // ,
+    g_hid_to_dscan[0x37] = DSCAN_FULL_STOP; // .
+    g_hid_to_dscan[0x38] = DSCAN_SLASH;     // /
+    g_hid_to_dscan[0x2F] = DSCAN_AT;        // [ -> @ (CoCo @ key)
+    g_hid_to_dscan[0x4C] = DSCAN_CLEAR;     // Delete -> CLEAR
+    g_hid_to_dscan[0x4F] = DSCAN_RIGHT;     // arrows
+    g_hid_to_dscan[0x50] = DSCAN_LEFT;
+    g_hid_to_dscan[0x51] = DSCAN_DOWN;
+    g_hid_to_dscan[0x52] = DSCAN_UP;
+    g_hid_to_dscan[0x29] = DSCAN_BREAK;
+}
+
+static uint8_t g_prev_codes[6] = {0};
+static bool    g_shift_prev = false;
+
+// HID modifier bits: L/R Ctrl 0x01/0x10, L/R Alt 0x04/0x40, L/R Shift 0x02/0x20.
+static void hid_keyboard_apply(const uint8_t *report) {
+    uint8_t mods = report[0];
+    const uint8_t *codes = &report[2];
+
+    // Reset chord: Ctrl+Alt+Delete (HID 0x4C) -> warm reset. Checked before the
+    // matrix diff so the chord itself never leaks keys into BASIC.
+    bool ctrl = mods & 0x11, alt = mods & 0x44;
+    for (int i = 0; i < 6; i++) {
+        if (codes[i] == 0x4C && ctrl && alt) {
+            coco_machine_reset();
+            g_shift_prev = false; memset(g_prev_codes, 0, sizeof(g_prev_codes));
+            return;
+        }
+    }
+
+    bool shift = (mods & 0x22) != 0;
+    if (shift && !g_shift_prev) coco_machine_press_key(DSCAN_SHIFT);
+    if (!shift && g_shift_prev) coco_machine_release_key(DSCAN_SHIFT);
+    g_shift_prev = shift;
+
+    // Releases: was in prev, not in current.
+    for (int i = 0; i < 6; i++) {
+        uint8_t p = g_prev_codes[i];
+        if (!p) continue;
+        bool still = false;
+        for (int j = 0; j < 6; j++) if (codes[j] == p) { still = true; break; }
+        if (!still && g_hid_to_dscan[p] != 0xFF) coco_machine_release_key(g_hid_to_dscan[p]);
+    }
+    // Presses: in current, not in prev.
+    for (int i = 0; i < 6; i++) {
+        uint8_t c = codes[i];
+        if (!c) continue;
+        bool was = false;
+        for (int j = 0; j < 6; j++) if (g_prev_codes[j] == c) { was = true; break; }
+        if (!was && g_hid_to_dscan[c] != 0xFF) coco_machine_press_key(g_hid_to_dscan[c]);
+    }
+    memcpy(g_prev_codes, codes, 6);
+}
+
+extern "C" void tuh_hid_mount_cb(uint8_t daddr, uint8_t idx,
+                                 uint8_t const *desc, uint16_t len) {
+    (void)desc; (void)len;
+    tuh_hid_receive_report(daddr, idx);
+}
+extern "C" void tuh_hid_umount_cb(uint8_t daddr, uint8_t idx) {
+    (void)daddr; (void)idx;
+    coco_machine_release_all_keys();     // drop stuck keys if the keyboard leaves
+    memset(g_prev_codes, 0, sizeof(g_prev_codes));
+    g_shift_prev = false;
+}
+extern "C" void tuh_hid_report_received_cb(uint8_t daddr, uint8_t idx,
+                                           uint8_t const *report, uint16_t len) {
+    // Only the boot-keyboard interface (8-byte reports). Others (consumer/etc.)
+    // are ignored but must still be re-armed.
+    if (tuh_hid_interface_protocol(daddr, idx) == HID_ITF_PROTOCOL_KEYBOARD && len >= 8)
+        hid_keyboard_apply(report);
+    tuh_hid_receive_report(daddr, idx);  // re-arm
+}
+
+// Core 1: the pico_hdmi video engine (never returns). Launched manually from
+// setup() after USB host init — see the multicore_launch_core1 note there.
+static void core1_video_entry() {
+    video_output_core1_run();
+}
+
 void setup() {
     vreg_set_voltage(VREG_VOLTAGE_1_25);
     delay(2);
     set_sys_clock_khz(252000, true);
+
+    // Host 5V on early so the CH334F hub PHY settles before the host starts.
+    pinMode(USB_5V_EN, OUTPUT);
+    digitalWrite(USB_5V_EN, HIGH);
 
     Serial.begin(115200);
     const uint32_t start = millis();
@@ -145,6 +259,28 @@ void setup() {
     // before video init so pico_hdmi can claim them as it expects.
     dma_channel_claim(0);
     dma_channel_claim(1);
+
+    // USB host FIRST — before SD/video. In the standalone test begin() worked
+    // when it ran on a clean machine; in the combined build it hung, because SD
+    // or pico_hdmi init first grabs a hardware resource PIO-USB needs in begin()
+    // (a hardware alarm for alarm_pool_create). Init it up front so it gets that
+    // resource. DMA 0/1 are reserved above for pico_hdmi, so PIO-USB's
+    // dma_claim_unused takes 2/3; SD then takes 4/5; video reclaims 0/1.
+    Serial.print("STAGE usb host... "); Serial.flush(); delay(20);
+    hid_map_init();
+    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+    pio_cfg.pin_dp     = HOST_PIN_DP;
+    pio_cfg.pio_tx_num = 0;
+    pio_cfg.pio_rx_num = 0;
+    // PIO-USB's begin() does dma_claim_mask(1 << tx_ch); its default tx_ch is 0,
+    // which collides with pico_hdmi's hardcoded DMA 0 (reserved above) and hard-
+    // asserts (silent hang). Point it at a free channel: pico_hdmi=0/1, SD=2/3,
+    // so USB TX = 4.
+    pio_cfg.tx_ch = 4;
+    USBHost.configure_pio_usb(1, &pio_cfg);
+    tuh_hid_set_default_protocol(HID_PROTOCOL_BOOT);
+    USBHost.begin(1);
+    Serial.println("ok"); Serial.flush(); delay(20);
 
     Serial.print("STAGE mount SD... "); Serial.flush(); delay(20);
     if (!mount_sd()) { Serial.println("FATAL: no SD"); while (1) delay(500); }
@@ -183,24 +319,25 @@ void setup() {
     video_output_set_background_task(video_output_compose_service);
     Serial.println("ok"); Serial.flush(); delay(20);
 
-    g_video_ready = true;   // release core 1
-
-    Serial.printf("clk_sys=%lu clk_hstx=%lu MHz. Entering emulation loop.\n",
+    Serial.printf("clk_sys=%lu clk_hstx=%lu MHz. Starting video on core 1.\n",
                   (unsigned long)(clock_get_hz(clk_sys) / 1000000),
                   (unsigned long)(clock_get_hz(clk_hstx) / 1000000));
     Serial.flush(); delay(20);
-}
 
-// Core 1: video engine.
-void setup1() {
-    while (!g_video_ready) tight_loop_contents();
-    video_output_core1_run();   // never returns
+    // Launch core 1 LAST — after USB host init on core 0 — so PIO-USB's begin()
+    // cross-core setup can't deadlock against a core 1 already running the video
+    // DMA-IRQ loop (the pizero ordering). We drive core 1 manually rather than
+    // via setup1(), which the framework would auto-launch too early.
+    multicore_launch_core1(core1_video_entry);
+    Serial.println("STAGE core1 launched — entering loop."); Serial.flush(); delay(20);
 }
 
 // Core 0: emulate one field, compose, pace to ~60 Hz (resync-not-debt).
 void loop() {
     static uint32_t deadline = 0;
     static uint32_t frames = 0, last_report = 0, run_us_acc = 0;
+
+    USBHost.task();   // service PIO-USB host: fires the HID callbacks -> keys
 
     uint32_t t0 = micros();
     coco_machine_run_cycles(CYCLES_PER_FRAME);
@@ -240,5 +377,3 @@ void loop() {
     }
     delay(1);   // yield so the USB CDC task runs (serial + 1200-baud reset)
 }
-
-void loop1() { /* unreached */ }
