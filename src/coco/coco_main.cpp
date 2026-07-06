@@ -350,6 +350,25 @@ extern "C" void tuh_hid_report_received_cb(uint8_t daddr, uint8_t idx,
     tuh_hid_receive_report(daddr, idx);  // re-arm
 }
 
+// Deferred HSTX resync (freeze fix). The desync watchdog runs on core 0, but the
+// video DMA-IRQ handler and all HSTX/DMA state live on core 1. Calling
+// video_output_force_resync() from core 0 tears that state down while core 1's
+// IRQ is still firing into it — and its irq_set_enabled(DMA_IRQ_1) only gates
+// core 0's NVIC, not core 1's — a cross-core race that hard-locks the board.
+// Instead core 0 just requests a resync; core 1 performs it from its background
+// task, where disabling DMA_IRQ_1 actually holds off the local handler.
+static volatile bool     g_want_resync  = false;
+static volatile uint32_t g_resync_count = 0;
+
+static void core1_background(void) {
+    video_output_compose_service();
+    if (g_want_resync) {
+        g_want_resync = false;
+        video_output_force_resync();   // safe here: runs on core 1, gates its own IRQ
+        g_resync_count++;
+    }
+}
+
 // Core 1: the pico_hdmi video engine (never returns). Launched manually from
 // setup() after USB host init — see the multicore_launch_core1 note there.
 static void core1_video_entry() {
@@ -445,7 +464,7 @@ void setup() {
     video_output_set_compose_ring(g_compose_ring, sizeof(g_compose_ring) / sizeof(g_compose_ring[0]));
     video_output_set_native_pixel_mode(true);
     video_output_set_scanline_pointer_callback(scanline_ptr_cb);
-    video_output_set_background_task(video_output_compose_service);
+    video_output_set_background_task(core1_background);
     Serial.println("ok"); Serial.flush(); delay(20);
 
     Serial.printf("clk_sys=%lu clk_hstx=%lu MHz. Starting video on core 1.\n",
@@ -495,13 +514,14 @@ void loop() {
                       (unsigned long)(FRAME_US * (frames - last_report) / run_us_acc),
                       (unsigned long)((uint64_t)FRAME_US * (frames - last_report) * 100 / run_us_acc % 100),
                       (unsigned long)vf, (unsigned long)fps, g_audio_peak);
+        if (g_resync_count) Serial.printf("  (resyncs so far: %lu)\n", (unsigned long)g_resync_count);
         g_audio_peak = 0;
 
         // Desync watchdog: a healthy 60p link advances ~60 fps. If frames race
         // (>90 fps) the HSTX stream has desynced (FIFO underran) — restart it.
         if (last_ms && fps > 90) {
-            video_output_force_resync();
-            Serial.println("  ! HSTX desync detected -> forced resync");
+            g_want_resync = true;   // core 1 performs the resync safely (see core1_background)
+            Serial.println("  ! HSTX desync detected -> resync requested (core1)");
         }
         last_vf = vf; last_ms = now_ms;
         last_report = frames; run_us_acc = 0;
