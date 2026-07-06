@@ -62,6 +62,12 @@
 #include "part.h"
 #include "serialise.h"
 
+// FRUITJAM-15: place the 6809 opcode-dispatch loop in SRAM. mc6809_run is the
+// single hottest function (~15 KB, mc680x_ops.c is #included into it) and alone
+// overruns the RP2350's ~16 KB XIP cache, so in flash every instruction pays
+// flash-fetch latency. HOT_FUNC moves it to .time_critical (single-cycle RAM).
+#include "hot.h"
+
 #ifdef TRACE
 #include "mc6809_trace.h"
 #endif
@@ -251,7 +257,7 @@ static void mc6809_reset(struct MC6809 *cpu) {
 
 // Run CPU while cpu->running is true.
 
-static void mc6809_run(struct MC6809 *cpu) {
+static void HOT_FUNC(mc6809_run)(struct MC6809 *cpu) {
 
 	do {
 

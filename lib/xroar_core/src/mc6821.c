@@ -29,6 +29,10 @@
 #include "logging.h"
 #include "part.h"
 #include "serialise.h"
+
+// FRUITJAM-15: the CPU bus hits the PIA read/write path on every I/O access
+// (keyboard scan every field, dense during SOUND); keep it in SRAM (core set).
+#include "hot.h"
 #include "xroar.h"
 
 static const struct ser_struct ser_struct_mc6821_side[] = {
@@ -227,7 +231,7 @@ void mc6821_update_cb2_state(struct MC6821 *pia) {
 	mc6821_update_cx2_state(&pia->b, PIA_VALUE_CB2(pia));
 }
 
-uint8_t mc6821_read(struct MC6821 *pia, uint16_t A) {
+uint8_t HOT_FUNC(mc6821_read)(struct MC6821 *pia, uint16_t A) {
 	switch (A & 3) {
 		default:
 		case 0:
@@ -290,7 +294,7 @@ static void write_cr(struct MC6821_side *side, uint8_t D) {
 	}
 }
 
-void mc6821_write(struct MC6821 *pia, uint16_t A, uint8_t D) {
+void HOT_FUNC(mc6821_write)(struct MC6821 *pia, uint16_t A, uint8_t D) {
 	switch (A & 3) {
 		default:
 

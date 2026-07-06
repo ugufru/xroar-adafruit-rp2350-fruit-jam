@@ -125,7 +125,7 @@ static void snd_event(void);
 // into the INT/EXT bit as upstream dragon/coco wiring does, then hand to the VDG.
 // PB also carries the single-bit sound line (PB1), so an audio event fires here
 // too (mirrors dragon_pia1b_data_postwrite: single-bit + VDG mode).
-extern "C" void coco_pia1b_postwrite(void *sptr) {
+extern "C" void HOT_FUNC(coco_pia1b_postwrite)(void *sptr) {
     (void)sptr;
     if (!g_m.pia1 || !g_m.vdg) return;
     snd_event();                                // single-bit sound (PB1)
@@ -135,10 +135,12 @@ extern "C" void coco_pia1b_postwrite(void *sptr) {
 }
 
 // PIA1 port A write = 6-bit DAC update.  PIA1 CB2 (control) = sound-mux enable.
-extern "C" void coco_pia1a_postwrite(void *sptr)      { (void)sptr; snd_event(); }
-extern "C" void coco_pia1b_control_postwrite(void *sptr) { (void)sptr; snd_event(); }
+// FRUITJAM-15: these fire from the hot coco_mem_cycle on every PIA write (dense
+// during SOUND), so keep them and snd_compute() in SRAM (core-set I/O path).
+extern "C" void HOT_FUNC(coco_pia1a_postwrite)(void *sptr)      { (void)sptr; snd_event(); }
+extern "C" void HOT_FUNC(coco_pia1b_control_postwrite)(void *sptr) { (void)sptr; snd_event(); }
 // PIA0 CA2/CB2 (control writes) = sound-mux source select.
-extern "C" void coco_pia0_control_postwrite(void *sptr)  { (void)sptr; snd_event(); }
+extern "C" void HOT_FUNC(coco_pia0_control_postwrite)(void *sptr)  { (void)sptr; snd_event(); }
 
 // - - - audio tap + resampler (FRUITJAM-13) -----------------------------------
 // The CoCo sound bus, modelled exactly as XRoar's dragon.c/sound.c:
@@ -194,7 +196,7 @@ static float    g_snd_dc_x1     = 0.0f;   // DC-blocker state
 static float    g_snd_dc_y1     = 0.0f;
 
 // Collapse the PIA sound pins into the analog bus level (sound.c bus_level).
-static float snd_compute(void) {
+static float HOT_FUNC(snd_compute)(void) {
     if (!g_m.pia1 || !g_m.pia0) return g_snd_cur_bus;
     bool  enabled = PIA_VALUE_CB2(g_m.pia1);
     float dac     = (float)(PIA_VALUE_A(g_m.pia1) & 0xFC) / 252.0f;
