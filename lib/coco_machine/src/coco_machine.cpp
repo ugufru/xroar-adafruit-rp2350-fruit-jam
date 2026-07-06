@@ -117,15 +117,172 @@ extern "C" void coco_machine_release_all_keys(void) {
     memset(g_kb_col_row_mask, 0xFF, sizeof(g_kb_col_row_mask));
 }
 
+// Forward decl for the audio tap (defined in the audio section below).
+static void snd_event(void);
+
 // - - - VDG mode select -------------------------------------------------------
 // PIA1 port B bits 7..3 = VDG mode lines (¬A/G, GM2, GM1, GM0, CSS). Mirror GM0
 // into the INT/EXT bit as upstream dragon/coco wiring does, then hand to the VDG.
+// PB also carries the single-bit sound line (PB1), so an audio event fires here
+// too (mirrors dragon_pia1b_data_postwrite: single-bit + VDG mode).
 extern "C" void coco_pia1b_postwrite(void *sptr) {
     (void)sptr;
     if (!g_m.pia1 || !g_m.vdg) return;
+    snd_event();                                // single-bit sound (PB1)
     unsigned pb = (g_m.pia1->b.out_source & g_m.pia1->b.out_sink) & 0xF8;
     unsigned vmode = pb | ((pb & 0x10) << 4);   // GM0 -> INT/EXT
     mc6847_set_mode(g_m.vdg, vmode);
+}
+
+// PIA1 port A write = 6-bit DAC update.  PIA1 CB2 (control) = sound-mux enable.
+extern "C" void coco_pia1a_postwrite(void *sptr)      { (void)sptr; snd_event(); }
+extern "C" void coco_pia1b_control_postwrite(void *sptr) { (void)sptr; snd_event(); }
+// PIA0 CA2/CB2 (control writes) = sound-mux source select.
+extern "C" void coco_pia0_control_postwrite(void *sptr)  { (void)sptr; snd_event(); }
+
+// - - - audio tap + resampler (FRUITJAM-13) -----------------------------------
+// The CoCo sound bus, modelled exactly as XRoar's dragon.c/sound.c:
+//   * 6-bit DAC  = PIA1 port A bits 7..2                       (PIA_VALUE_A & 0xFC)
+//   * mux enable = PIA1 CB2                                    (PIA_VALUE_CB2(pia1))
+//   * single-bit = PIA1 PB1                                    (port B bit 1)
+//   * mux source = PIA0 CB2:CA2                                (0 = DAC)
+// (Note: the FRUITJAM-13 issue calls the single-bit line CB2; upstream XRoar
+// 1.11 — the core we vendored — wires single-bit to PB1 and uses CB2 as the mux
+// *enable*. We follow the vendored source, which is self-consistent and covers
+// both: SOUND/PLAY via the DAC, and 1-bit audio via either the CB2 enable toggle
+// or the PB1 line. Flagged for maintainer reconciliation.)
+//
+// snd_recompute() collapses those pins into a single analog bus level (0..~1),
+// reproducing sound.c's per-source gain/DC-offset tables (MAX_V = 4.70 V). The
+// bus is integrate-and-dumped over CPU cycles into 48 kHz mono; a one-pole DC
+// blocker removes the (large, note-dependent) DC term so the AC waveform — the
+// actual sound — is centered before it reaches the DAC.
+
+// sound.c source_gain_v/source_offset_v, DAC and single-bit rows, /MAX_V.
+static const float MAX_V = 4.70f;
+static const float DAC_GAIN[3] = { 4.50f / MAX_V, 2.84f / MAX_V, 3.40f / MAX_V };
+static const float DAC_OFF[3]  = { 0.20f / MAX_V, 0.18f / MAX_V, 1.30f / MAX_V };
+static const float SBS_OFF[3]  = { 0.00f,         0.00f,         3.90f / MAX_V };
+
+// Output scaling. The CoCo SOUND DAC does not swing full-scale, and (per
+// sound.c) the single-bit config drops the DAC gain to ~0.6-0.7x, so the steady
+// tone AC is well under half scale — 20000 left it quieter than the FRUITJAM-07
+// test tone. On-hardware measurement (serial audio_peak) showed the note-edge DC
+// steps reaching ~0.82 of full scale; 32000 lifts the steady tone to roughly the
+// test-tone level while keeping those transients (0.82 * 32000 ~= 26k) just under
+// the 32767 clip. Higher gains clip the edges into clicks.
+static const float AUDIO_GAIN = 32000.0f;
+
+// Event log of bus-level CHANGES during the current field: each PIA sound write
+// appends {cycle, new bus level}. render_audio (run once after the field) then
+// replays the log to integrate each 48 kHz sample over ITS OWN cycle span. This
+// separation is essential: the hooks fire mid-field while render runs after it,
+// so the two must not share one accumulator (the earlier bug collapsed a whole
+// field of toggles into a single clipped sample). A square-wave SOUND is a few
+// hundred edges/field; 1024 covers well past any audible tone (overflow just
+// drops later edges that field — graceful).
+struct SndSeg { uint32_t cyc; float bus; };
+static SndSeg   g_snd_log[1024];
+static int      g_snd_log_n     = 0;      // entries recorded this field
+static int      g_snd_log_rd    = 0;      // render read cursor
+static float    g_snd_cur_bus   = 0.0f;   // latest bus level (hook side)
+static float    g_snd_seg_bus   = 0.0f;   // bus level of the segment render is in
+static uint32_t g_snd_bound_cyc = 0;      // start cycle of the next sample
+static uint32_t g_snd_frac_q16  = 0;      // fractional-cycle remainder, 16.16
+static uint32_t g_snd_cps_q16   = 0;      // cycles per 48 kHz sample, 16.16
+static float    g_snd_dc_x1     = 0.0f;   // DC-blocker state
+static float    g_snd_dc_y1     = 0.0f;
+
+// Collapse the PIA sound pins into the analog bus level (sound.c bus_level).
+static float snd_compute(void) {
+    if (!g_m.pia1 || !g_m.pia0) return g_snd_cur_bus;
+    bool  enabled = PIA_VALUE_CB2(g_m.pia1);
+    float dac     = (float)(PIA_VALUE_A(g_m.pia1) & 0xFC) / 252.0f;
+    // Single-bit sound on PIA1 PB1 (upstream dragon_pia1b_data_postwrite).
+    unsigned bsrc = g_m.pia1->b.out_source, bsnk = g_m.pia1->b.out_sink;
+    bool sbs_enabled = !((bsrc ^ bsnk) & (1u << 1));
+    bool sbs_level   =  (bsrc & bsnk & (1u << 1)) != 0;
+    if (enabled) {
+        unsigned src = ((unsigned)PIA_VALUE_CB2(g_m.pia0) << 1) | (unsigned)PIA_VALUE_CA2(g_m.pia0);
+        unsigned si  = sbs_enabled ? (sbs_level ? 2u : 1u) : 0u;
+        float raw = (src == 0) ? dac : 0.0f;   // only the DAC source is emulated
+        return raw * DAC_GAIN[si] + DAC_OFF[si];
+    }
+    if (sbs_enabled) return SBS_OFF[sbs_level ? 2 : 1];
+    return g_snd_cur_bus;   // mux off, single-bit as input -> hold last level
+}
+
+// PIA write hook: record the new bus level (with its CPU-cycle timestamp) iff it
+// changed. total_mem_cycles is already incremented for the in-progress cycle.
+static inline void snd_event(void) {
+    float b = snd_compute();
+    if (b != g_snd_cur_bus) {
+        g_snd_cur_bus = b;
+        if (g_snd_log_n < (int)(sizeof(g_snd_log) / sizeof(g_snd_log[0])))
+            g_snd_log[g_snd_log_n++] = { g_m.total_mem_cycles, b };
+    }
+}
+
+extern "C" void coco_machine_audio_init(uint32_t cycles_per_field, uint32_t field_us) {
+    if (cycles_per_field == 0 || field_us == 0) {
+        cycles_per_field = 14915;   // authentic NTSC field (see coco_main.cpp)
+        field_us         = 16762;
+    }
+    // cycles per 48 kHz sample = cycles_per_field / (field_us * 48000 / 1e6).
+    g_snd_cps_q16 = (uint32_t)(((uint64_t)cycles_per_field * 1000000ULL * 65536ULL) /
+                               ((uint64_t)field_us * 48000ULL));
+    g_snd_frac_q16  = 0;
+    g_snd_bound_cyc = g_m.total_mem_cycles;
+    g_snd_log_n = g_snd_log_rd = 0;
+    g_snd_cur_bus = g_snd_seg_bus = snd_compute();
+}
+
+extern "C" int coco_machine_render_audio(int16_t *out, int max) {
+    if (g_snd_cps_q16 == 0) coco_machine_audio_init(0, 0);
+    const uint32_t end = g_m.total_mem_cycles;
+    int n = 0;
+    while (n < max) {
+        uint32_t step_q16 = g_snd_frac_q16 + g_snd_cps_q16;
+        uint32_t step     = step_q16 >> 16;
+        uint32_t target   = g_snd_bound_cyc + step;
+        if ((int32_t)(target - end) > 0) break;   // not enough emulated time yet
+        g_snd_frac_q16 = step_q16 & 0xFFFF;
+
+        // Integrate the piecewise-constant bus over [g_snd_bound_cyc, target),
+        // walking any change events that fall inside this sample's span.
+        float    integral = 0.0f;
+        uint32_t c        = g_snd_bound_cyc;
+        float    level    = g_snd_seg_bus;
+        while (g_snd_log_rd < g_snd_log_n &&
+               (int32_t)(g_snd_log[g_snd_log_rd].cyc - target) < 0) {
+            uint32_t ec = g_snd_log[g_snd_log_rd].cyc;
+            if ((int32_t)(ec - c) > 0) { integral += level * (int32_t)(ec - c); c = ec; }
+            level = g_snd_log[g_snd_log_rd].bus;
+            g_snd_log_rd++;
+        }
+        integral += level * (int32_t)(target - c);
+        g_snd_seg_bus   = level;
+        g_snd_bound_cyc = target;
+
+        float avg = (step != 0) ? (integral / (int32_t)step) : level;
+        // One-pole DC blocker (R = 0.9995, ~4 Hz / ~42 ms tau): removes the
+        // note-dependent DC offset while leaving the tone's shape and level.
+        float y = avg - g_snd_dc_x1 + 0.9995f * g_snd_dc_y1;
+        g_snd_dc_x1 = avg;
+        g_snd_dc_y1 = y;
+        int32_t s = (int32_t)(y * AUDIO_GAIN);
+        if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+        out[n++] = (int16_t)s;
+    }
+
+    // Drop consumed events; carry any past `end` (not yet sampled) to next field.
+    if (g_snd_log_rd > 0) {
+        int rem = g_snd_log_n - g_snd_log_rd;
+        for (int i = 0; i < rem; i++) g_snd_log[i] = g_snd_log[g_snd_log_rd + i];
+        g_snd_log_n  = rem;
+        g_snd_log_rd = 0;
+    }
+    return n;
 }
 
 // - - - bus -------------------------------------------------------------------
@@ -281,6 +438,9 @@ extern "C" _Bool coco_machine_init(const uint8_t *rom, size_t rom_len) {
     g_m.pia0->a.in_sink   = 0xFF;
     g_m.pia0->b.in_source = 0xFF;
     g_m.pia0->a.data_preread = DELEGATE_AS0(void, coco_pia0_preread_a, NULL);
+    // PIA0 CA2/CB2 select the sound-mux source (FRUITJAM-13).
+    g_m.pia0->a.control_postwrite = DELEGATE_AS0(void, coco_pia0_control_postwrite, NULL);
+    g_m.pia0->b.control_postwrite = DELEGATE_AS0(void, coco_pia0_control_postwrite, NULL);
 
     p = part_create("MC6821", NULL);      // PIA1: VDG mode + (later) sound
     if (!p) return 0;
@@ -288,6 +448,9 @@ extern "C" _Bool coco_machine_init(const uint8_t *rom, size_t rom_len) {
     mc6821_reset(g_m.pia1);
     g_m.pia1->b.in_source = 0xFF;
     g_m.pia1->b.data_postwrite = DELEGATE_AS0(void, coco_pia1b_postwrite, NULL);
+    // Audio tap (FRUITJAM-13): DAC on port A, mux-enable on CB2.
+    g_m.pia1->a.data_postwrite    = DELEGATE_AS0(void, coco_pia1a_postwrite, NULL);
+    g_m.pia1->b.control_postwrite = DELEGATE_AS0(void, coco_pia1b_control_postwrite, NULL);
 
     // CoCo 2 ships the 6847T1 (lowercase via inverse bit). The non-T1 font path
     // in mc6847.c is then dead at runtime (font_6847[] is a link-time stub).
@@ -301,6 +464,11 @@ extern "C" _Bool coco_machine_init(const uint8_t *rom, size_t rom_len) {
     mc6847_reset(g_m.vdg);
     mc6847_set_mode(g_m.vdg, 0);
     mc6847_unpause(g_m.vdg);
+
+    // Audio: seat the resampler at the current (zero) cycle and capture the
+    // reset bus level so integration starts from a defined state.
+    coco_machine_audio_init(0, 0);
+    g_snd_dc_x1 = g_snd_dc_y1 = 0.0f;
 
     return 1;
 }

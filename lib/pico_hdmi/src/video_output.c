@@ -296,8 +296,9 @@ static void __scratch_x("") hstx_resync(void)
     vactive_cmdlist_posted = false;
     dma_pong = false;
 
-    // 4. Clear any pending DMA interrupts
-    dma_hw->ints0 = (1U << DMACH_PING) | (1U << DMACH_PONG);
+    // 4. Clear any pending DMA interrupts (this engine uses DMA_IRQ_1 — see the
+    //    init below; ints1 is the IRQ_1 status register).
+    dma_hw->ints1 = (1U << DMACH_PING) | (1U << DMACH_PONG);
 
     // 5. Configure DMA PING to start from beginning of frame (Line 0)
     dma_channel_hw_t *ch_ping = &dma_hw->ch[DMACH_PING];
@@ -845,11 +846,19 @@ void video_output_core1_run(void)
     }
 #endif
 
-    dma_hw->ints0 = (1U << DMACH_PING) | (1U << DMACH_PONG);
-    dma_hw->inte0 = (1U << DMACH_PING) | (1U << DMACH_PONG);
-    irq_set_exclusive_handler(DMA_IRQ_0, dma_irq_handler);
-    irq_set_priority(DMA_IRQ_0, 0);
-    irq_set_enabled(DMA_IRQ_0, true);
+    // This scanout engine runs its DMA-completion handler on Core 1 via
+    // DMA_IRQ_1 (INTE1), NOT DMA_IRQ_0. The earlephilhower I2S DMA (FRUITJAM-13)
+    // owns DMA_IRQ_0 with a *shared* handler on Core 0, and dma_irq_handler()
+    // below does not filter by channel — so if both engines shared IRQ line 0
+    // every I2S buffer completion would spuriously tick the scanout state
+    // machine on Core 1 and desync the link (black screen, video_frame_count
+    // frozen). Putting video on IRQ_1 keeps the two lines fully independent
+    // (SPI-SD is polled, PIO-USB uses no DMA IRQ, so IRQ_1 is free).
+    dma_hw->ints1 = (1U << DMACH_PING) | (1U << DMACH_PONG);
+    dma_hw->inte1 = (1U << DMACH_PING) | (1U << DMACH_PONG);
+    irq_set_exclusive_handler(DMA_IRQ_1, dma_irq_handler);
+    irq_set_priority(DMA_IRQ_1, 0);
+    irq_set_enabled(DMA_IRQ_1, true);
 
     bus_ctrl_hw->priority = BUSCTRL_BUS_PRIORITY_DMA_W_BITS | BUSCTRL_BUS_PRIORITY_DMA_R_BITS;
     dma_channel_start(DMACH_PING);
@@ -877,8 +886,8 @@ void video_output_force_resync(void)
     // sink loses lock while scanlines "complete" at bus speed because the
     // FIFO no longer back-pressures). Safe to call from Core 1 thread
     // context; the scanline ISR is held off during the reset.
-    irq_set_enabled(DMA_IRQ_0, false);
+    irq_set_enabled(DMA_IRQ_1, false);
     hstx_resync();
-    irq_set_enabled(DMA_IRQ_0, true);
+    irq_set_enabled(DMA_IRQ_1, true);
     video_output_resync_count++;
 }

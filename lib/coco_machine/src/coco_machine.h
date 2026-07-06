@@ -56,6 +56,26 @@ void coco_machine_render_frame(void);
 // machine's lifetime; do not free or write.
 const uint8_t *coco_machine_get_vdg_buffer(void);
 
+// - - - audio (FRUITJAM-13) ---------------------------------------------------
+// The CoCo sound seam. The machine taps PIA1's 6-bit DAC (PA7-2), the sound-mux
+// enable (PIA1 CB2), the single-bit sound line (PIA1 PB1) and the mux source
+// select (PIA0 CA2/CB2), computes the analog sound-bus level exactly as XRoar's
+// dragon.c/sound.c do, and integrate-and-dumps it into 48 kHz mono samples keyed
+// to CPU cycle timestamps. The platform pulls PCM and feeds it to the I2S DAC.
+//
+// coco_machine_audio_init sets the resample cadence: it must match the pacing
+// the platform actually runs the emulator at (cycles per field / field period
+// in microseconds), so one field's samples equal what a real-time 48 kHz sink
+// drains in that field — otherwise the sink ring slowly drifts. Called once,
+// after coco_machine_init. Passing 0/0 keeps the authentic-NTSC default.
+void coco_machine_audio_init(uint32_t cycles_per_field, uint32_t field_us);
+
+// Pull up to `max` mono signed-16-bit samples generated since the last call,
+// integrate-and-dumped over the CPU cycles executed since then. Returns the
+// count produced (tracks emulated time; ~805 per 16762 us field). Call once per
+// field, after coco_machine_run_cycles.
+int coco_machine_render_audio(int16_t *out, int max);
+
 // Keyboard injection by XRoar DSCAN_* code (see xroar_core dkbd.h). All keys
 // released at init. FRUITJAM-12 maps USB HID onto this.
 void coco_machine_press_key(uint8_t dscan);

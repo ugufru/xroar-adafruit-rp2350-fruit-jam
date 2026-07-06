@@ -17,6 +17,9 @@
 
 #include <Arduino.h>
 #include <string.h>
+#include <Wire.h>
+#include <I2S.h>
+#include <Adafruit_TLV320DAC3100.h>
 #include "pico/multicore.h"
 #include "hardware/vreg.h"
 #include "hardware/clocks.h"
@@ -125,6 +128,124 @@ static size_t load_rom(const char *path) {
     f_read(&f, g_rom, sizeof(g_rom), &br);
     f_close(&f);
     return br;
+}
+
+// - - - CoCo audio -> TLV320 DAC over I2S (FRUITJAM-13) ------------------------
+// The machine produces 48 kHz mono PCM from its PIA sound tap (coco_machine
+// render_audio); this side is the sink: the TLV320DAC3100 configured over I2C0
+// exactly as the FRUITJAM-07 bring-up, fed by the earlephilhower PIO-I2S master.
+//
+// Producer (this core, once per field) and the I2S DMA (hardware) share the I2S
+// library's ring: we write each field's samples non-blocking, then top the ring
+// back up to its half mark with the last sample (hold-last) so a late field
+// can't underrun into a click. The 2048-frame ring (~43 ms) spans >2 fields, so
+// the once-per-field feed keeps the DMA fed through the pacing delay.
+#define PIN_I2C_SDA    20
+#define PIN_I2S_DATA   24
+#define PIN_I2S_BCLK   26    // LRCLK = BCLK+1 = 27
+#define PIN_PERIPH_RST 22    // shared TLV320 + ESP32-C6 reset (pulse once)
+
+// 0 = headphone jack only (feeding an external amp); 1 = onboard class-D speaker.
+#define SPEAKER_OUTPUT 0
+
+static Adafruit_TLV320DAC3100 g_codec;
+static I2S                    g_i2s(OUTPUT);
+
+// Ring geometry: setBuffers(16, 128) = 2048 stereo frames = 8192 bytes. Keep the
+// ring ~half full: pad up to HALF_BYTES free with hold-last, bounding latency to
+// ~21 ms while leaving room for the next field's samples.
+static const int I2S_HALF_BYTES = 4096;
+
+static int16_t g_audio_buf[1024];   // one field is ~805 samples
+static int16_t g_audio_last = 0;    // hold-last value on underrun
+static int     g_audio_peak = 0;    // loudest |sample| since last report (level tuning)
+
+static inline void i2s_put(int16_t s) {
+    g_audio_last = s;
+    g_i2s.write((int32_t)(((uint32_t)(uint16_t)s << 16) | (uint16_t)s), false);  // L=R, non-blocking
+}
+
+static bool configure_codec() {
+    if (!g_codec.begin()) { Serial.println("codec.begin() FAILED"); return false; }
+    delay(10);
+    bool ok = true;
+    ok &= g_codec.setCodecInterface(TLV320DAC3100_FORMAT_I2S, TLV320DAC3100_DATA_LEN_16);
+    ok &= g_codec.setCodecClockInput(TLV320DAC3100_CODEC_CLKIN_PLL);
+    ok &= g_codec.setPLLClockInput(TLV320DAC3100_PLL_CLKIN_BCLK);
+    ok &= g_codec.setPLLValues(1, 2, 32, 0);       // P=1 R=2 J=32 D=0
+    ok &= g_codec.setNDAC(true, 8);
+    ok &= g_codec.setMDAC(true, 2);
+    ok &= g_codec.powerPLL(true);
+    ok &= g_codec.setDACDataPath(true, true, TLV320_DAC_PATH_NORMAL,
+                                 TLV320_DAC_PATH_NORMAL, TLV320_VOLUME_STEP_1SAMPLE);
+    ok &= g_codec.configureAnalogInputs(TLV320_DAC_ROUTE_MIXER, TLV320_DAC_ROUTE_MIXER,
+                                        false, false, false, false);
+    ok &= g_codec.setDACVolumeControl(false, false, TLV320_VOL_INDEPENDENT);
+    ok &= g_codec.setChannelVolume(false, 18);     // left  +0 dB
+    ok &= g_codec.setChannelVolume(true, 18);      // right +0 dB
+    ok &= g_codec.configureHeadphoneDriver(true, true, TLV320_HP_COMMON_1_35V, false);
+    ok &= g_codec.configureHPL_PGA(0, true);
+    ok &= g_codec.configureHPR_PGA(0, true);
+    ok &= g_codec.setHPLVolume(true, 6);
+    ok &= g_codec.setHPRVolume(true, 6);
+    // Internal speaker DISABLED: output goes to the 3.5mm headphone jack only
+    // (feeding an external amp). Set SPEAKER_OUTPUT to 1 to use the onboard
+    // speaker instead.
+    //
+    // Auto-mute-on-insert via the TLV320's headset detection (setHeadsetDetect /
+    // getHeadsetStatus, IRQ on GPIO23) was tried and did NOT work for a line
+    // cable into an amp: the detector is impedance-based and reads a high-Z amp
+    // input as "nothing plugged". Revisit only if real (low-Z) headphone use is
+    // wanted AND it's confirmed the Fruit Jam wires the detection usefully.
+    ok &= g_codec.enableSpeaker(SPEAKER_OUTPUT);
+    if (SPEAKER_OUTPUT) {
+        ok &= g_codec.configureSPK_PGA(TLV320_SPK_GAIN_6DB, true);
+        ok &= g_codec.setSPKVolume(true, 0);
+    }
+    return ok;
+}
+
+// Bring up the TLV320 + I2S master and prime the ring with silence. Mirrors the
+// FRUITJAM-07 sequencing: pulse the shared reset, I2C config, I2S master up with
+// BCLK live *before* the DAC PLL tries to lock.
+static bool audio_init() {
+    pinMode(PIN_PERIPH_RST, OUTPUT);
+    digitalWrite(PIN_PERIPH_RST, LOW);  delay(100);
+    digitalWrite(PIN_PERIPH_RST, HIGH); delay(100);
+
+    Wire.setSDA(PIN_I2C_SDA);
+    Wire.setSCL(PIN_I2C_SDA + 1);       // SCL = 21
+    Wire.begin();
+
+    g_i2s.setDATA(PIN_I2S_DATA);
+    g_i2s.setBCLK(PIN_I2S_BCLK);        // LRCLK = 27
+    g_i2s.setBitsPerSample(16);
+    g_i2s.setFrequency(48000);
+    g_i2s.setBuffers(16, 128);          // 2048 frames ring
+    if (!g_i2s.begin()) { Serial.println("I2S begin FAILED"); return false; }
+
+    // Prime to the half mark with silence so the DMA has a cushion before the
+    // first field's samples arrive.
+    while (g_i2s.availableForWrite() > I2S_HALF_BYTES) i2s_put(0);
+
+    return configure_codec();
+}
+
+// Per-field feed: push this field's PCM, then hold-last-pad back to the half mark.
+static void audio_feed() {
+    int n = coco_machine_render_audio(g_audio_buf, (int)(sizeof(g_audio_buf) / sizeof(g_audio_buf[0])));
+    int field_peak = 0;
+    for (int i = 0; i < n; i++) {
+        int a = g_audio_buf[i] < 0 ? -g_audio_buf[i] : g_audio_buf[i];
+        if (a > field_peak) field_peak = a;
+        if (a > g_audio_peak) g_audio_peak = a;
+        if (g_i2s.availableForWrite() < 4) break;   // ring full (overrun) — drop rest
+        i2s_put(g_audio_buf[i]);
+    }
+    (void)field_peak;
+    // Refill toward half with the last sample so a starved DMA repeats rather
+    // than clicking to silence (hold-last on underrun).
+    while (g_i2s.availableForWrite() > I2S_HALF_BYTES) i2s_put(g_audio_last);
 }
 
 // - - - USB HID keyboard -> CoCo matrix (FRUITJAM-12) --------------------------
@@ -296,7 +417,15 @@ void setup() {
 
     Serial.print("STAGE machine init... "); Serial.flush(); delay(20);
     if (!coco_machine_init(g_rom, got)) { Serial.println("FATAL: machine init"); while (1) delay(500); }
+    // Match the resampler cadence to our real-time pacing so the I2S ring neither
+    // starves nor overflows (see coco_machine_audio_init).
+    coco_machine_audio_init(CYCLES_PER_FRAME, FRAME_US);
     Serial.println("ok"); Serial.flush(); delay(20);
+
+    Serial.print("STAGE audio (TLV320+I2S)... "); Serial.flush(); delay(20);
+    if (audio_init()) Serial.println("ok");
+    else              Serial.println("FAILED (continuing, video only)");
+    Serial.flush(); delay(20);
 
     Serial.print("STAGE fill fb... "); Serial.flush(); delay(20);
     g_fb.fill(g_pal[8]);   // black border
@@ -343,6 +472,7 @@ void loop() {
     coco_machine_run_cycles(CYCLES_PER_FRAME);
     coco_machine_render_frame();
     blit_frame();
+    audio_feed();     // drain this field's PCM to the TLV320 over I2S
     run_us_acc += micros() - t0;
 
     // Pace to real time; resync if we fell behind rather than spiral (pizero
@@ -359,12 +489,13 @@ void loop() {
         uint32_t vf = video_frame_count;
         uint32_t fps = (last_ms && now_ms > last_ms) ? (vf - last_vf) * 1000 / (now_ms - last_ms) : 0;
 
-        Serial.printf("emu %lu fields, avg run %lu us/field (%lu.%02lux real-time), video_frames=%lu (%lu fps)\n",
+        Serial.printf("emu %lu fields, avg run %lu us/field (%lu.%02lux real-time), video_frames=%lu (%lu fps), audio_peak=%d/32767\n",
                       (unsigned long)frames,
                       (unsigned long)(run_us_acc / (frames - last_report)),
                       (unsigned long)(FRAME_US * (frames - last_report) / run_us_acc),
                       (unsigned long)((uint64_t)FRAME_US * (frames - last_report) * 100 / run_us_acc % 100),
-                      (unsigned long)vf, (unsigned long)fps);
+                      (unsigned long)vf, (unsigned long)fps, g_audio_peak);
+        g_audio_peak = 0;
 
         // Desync watchdog: a healthy 60p link advances ~60 fps. If frames race
         // (>90 fps) the HSTX stream has desynced (FIFO underran) — restart it.
