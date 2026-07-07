@@ -630,6 +630,37 @@ extern "C" void coco_machine_reset(void) {
     g_m.cpu->reset(g_m.cpu);
 }
 
+// - - - direct .bin loader (FRUITJAM-19) --------------------------------------
+extern "C" uint16_t coco_machine_load_bin(const uint8_t *bin, size_t len) {
+    if (!bin) return 0;
+    size_t p = 0;
+    uint16_t exec = 0;
+    while (p + 5 <= len) {
+        uint8_t  type = bin[p];
+        uint16_t blen = (uint16_t)(bin[p+1] << 8) | bin[p+2];   // big-endian
+        uint16_t addr = (uint16_t)(bin[p+3] << 8) | bin[p+4];
+        p += 5;
+        if (type == 0x00) {                       // data segment -> RAM
+            if (p + blen > len) break;            // truncated image
+            for (uint16_t i = 0; i < blen; i++)
+                g_ram[(uint16_t)(addr + i)] = bin[p + i];
+            p += blen;
+        } else if (type == 0xFF) {                // transfer (exec) segment
+            exec = addr;
+            break;
+        } else {
+            break;                                // malformed
+        }
+    }
+    return exec;
+}
+
+extern "C" void coco_machine_exec(uint16_t addr) {
+    if (!g_m.cpu) return;
+    g_m.cpu->reg_pc = addr;      // jump as EXEC would
+    g_m.cpu->reg_dp = 0;         // CoCo BASIC convention; most ML programs assume DP=0
+}
+
 extern "C" void coco_machine_run_cycles(uint32_t cycles) {
     if (!g_m.cpu) return;
 

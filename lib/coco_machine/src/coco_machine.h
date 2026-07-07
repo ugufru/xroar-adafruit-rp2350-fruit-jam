@@ -76,6 +76,19 @@ void coco_machine_audio_init(uint32_t cycles_per_field, uint32_t field_us);
 // field, after coco_machine_run_cycles.
 int coco_machine_render_audio(int16_t *out, int max);
 
+// - - - direct .bin loader (FRUITJAM-19) --------------------------------------
+// Inject a DECB machine-language binary (LOADM / .bin format: one or more
+// [0x00, len16, load16, data...] segments, terminated by [0xFF, 0x0000, exec16])
+// straight into CoCo RAM, bypassing tape/disk. Returns the exec address (0 on a
+// parse error / no transfer block). IMPORTANT: call this only AFTER BASIC has
+// finished cold-boot (it clears RAM during init, which would wipe the payload);
+// then call coco_machine_exec() to run it.
+uint16_t coco_machine_load_bin(const uint8_t *bin, size_t len);
+
+// Jump the CPU to `addr`, as BASIC's EXEC would. Safe to call between
+// coco_machine_run_cycles() (the CPU is not mid-instruction there).
+void coco_machine_exec(uint16_t addr);
+
 // - - - disk cartridge (FRUITJAM-29, in progress) -----------------------------
 // Map a RadioShack DOS / Disk BASIC cartridge ROM (typically disk11.rom, 8 KB)
 // into the cartridge window at $C000-$DFFF, so the CoCo boots Disk Extended

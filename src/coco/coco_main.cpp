@@ -151,21 +151,30 @@ static size_t load_cart_rom(const char *path) {
     return br;
 }
 
-static const uint8_t *g_cas_img = nullptr;
-static size_t load_cas(const char *path) {
+// Load a whole file into a fresh PSRAM buffer (tape/binary images: read in bulk,
+// cold path). Returns the buffer via *out and its size, or 0.
+static size_t load_psram_file(const char *path, const uint8_t **out) {
     FIL f;
     if (f_open(&f, path, FA_READ) != FR_OK) return 0;
     size_t sz = f_size(&f);
-    if (sz == 0) { f_close(&f); return 0; }
+    if (sz == 0 || sz > (1u << 20)) { f_close(&f); return 0; }
     uint8_t *buf = (uint8_t *)__psram_malloc(sz);
     if (!buf) { f_close(&f); return 0; }
     UINT br = 0;
     f_read(&f, buf, sz, &br);
     f_close(&f);
     if (br != sz) { __psram_free(buf); return 0; }
-    g_cas_img = buf;
+    *out = buf;
     return sz;
 }
+
+static const uint8_t *g_cas_img = nullptr;
+static size_t load_cas(const char *path) { return load_psram_file(path, &g_cas_img); }
+
+// DECB .bin auto-run (FRUITJAM-19): loaded at boot, injected + EXEC'd after BASIC
+// settles (its cold-boot RAM clear would otherwise wipe the payload).
+static const uint8_t *g_bin_img = nullptr;
+static size_t         g_bin_len = 0;
 
 // - - - CoCo audio -> TLV320 DAC over I2S (FRUITJAM-13) ------------------------
 // The machine produces 48 kHz mono PCM from its PIA sound tap (coco_machine
@@ -494,6 +503,10 @@ void setup() {
         if (dsk) { coco_machine_load_cart(g_cart, dsk);
                    Serial.printf("[disk cart: %u bytes] ", (unsigned)dsk); }
     }
+    // Optional: drop a DECB .bin at 0:/coco/bin/AUTO.BIN to auto-run it on boot.
+    g_bin_len = load_psram_file("0:/coco/bin/AUTO.BIN", &g_bin_img);
+    if (g_bin_len) Serial.printf("[AUTO.BIN queued: %u bytes -> auto-EXEC after boot] ",
+                                 (unsigned)g_bin_len);
     // Match the resampler cadence to our real-time pacing so the I2S ring neither
     // starves nor overflows (see coco_machine_audio_init).
     coco_machine_audio_init(CYCLES_PER_FRAME, FRAME_US);
@@ -544,6 +557,17 @@ void loop() {
     static uint32_t frames = 0, last_report = 0, run_us_acc = 0;
 
     USBHost.task();   // service PIO-USB host: fires the HID callbacks -> keys
+
+    // Auto-run AUTO.BIN once BASIC has cold-booted and cleared RAM (~2.5 s),
+    // then inject the payload and EXEC it. One-shot.
+    static uint32_t boot_fields = 0;
+    static bool     bin_launched = false;
+    if (!bin_launched && g_bin_img && ++boot_fields >= 150) {
+        uint16_t exec = coco_machine_load_bin(g_bin_img, g_bin_len);
+        if (exec) { coco_machine_exec(exec); Serial.printf("[AUTO.BIN exec @ $%04X]\n", exec); }
+        else        Serial.println("[AUTO.BIN: parse error / no exec block]");
+        bin_launched = true;
+    }
 
     uint32_t t0 = micros();
     coco_machine_run_cycles(CYCLES_PER_FRAME);
