@@ -121,11 +121,11 @@ static bool mount_sd() {
     }
     return false;
 }
-static size_t load_rom(const char *path) {
+static size_t load_rom_at(const char *path, size_t off, size_t max) {
     FIL f;
     if (f_open(&f, path, FA_READ) != FR_OK) return 0;
     UINT br = 0;
-    f_read(&f, g_rom, sizeof(g_rom), &br);
+    f_read(&f, g_rom + off, max, &br);
     f_close(&f);
     return br;
 }
@@ -465,12 +465,19 @@ void setup() {
     Serial.println("ok"); Serial.flush(); delay(20);
 
     Serial.print("STAGE load ROM... "); Serial.flush(); delay(20);
-    size_t got = load_rom("0:/coco/roms/bas12.rom");
+    // Prefer 16 KB Extended+Color BASIC (Extended enables PLAY and is required by
+    // Disk BASIC): extbas11 -> $8000-$9FFF, bas12 -> $A000-$BFFF. Fall back to
+    // Color BASIC alone if Extended isn't present.
+    size_t ext = load_rom_at("0:/coco/roms/extbas11.rom", 0, 8192);
+    size_t col = load_rom_at("0:/coco/roms/bas12.rom", 8192, 8192);
+    size_t got = (ext == 8192 && col == 8192) ? 16384 : 0;
+    if (!got) got = load_rom_at("0:/coco/roms/bas12.rom", 0, sizeof(g_rom));
     if (got != 8192 && got != 16384) {
         Serial.printf("FATAL: bad ROM size %u\n", (unsigned)got);
         while (1) delay(500);
     }
-    Serial.printf("ok (%u bytes)\n", (unsigned)got); Serial.flush(); delay(20);
+    Serial.printf("ok (%u bytes, %s)\n", (unsigned)got,
+                  got == 16384 ? "Extended+Color" : "Color"); Serial.flush(); delay(20);
 
     Serial.print("STAGE machine init... "); Serial.flush(); delay(20);
     if (!coco_machine_init(g_rom, got)) { Serial.println("FATAL: machine init"); while (1) delay(500); }

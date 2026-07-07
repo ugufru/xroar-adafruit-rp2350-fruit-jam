@@ -126,15 +126,17 @@ void setup() {
 
     if (!mount_sd()) return;
 
-    // Search conventional ROM locations, listing each; first ROM found wins.
-    static const char *dirs[] = { "0:/", "0:/coco", "0:/coco/roms", "0:/roms" };
+    // List the CoCo asset dirs so we can see exact filenames (FRUITJAM-19/29).
+    static const char *dirs[] = { "0:/coco/roms", "0:/coco/dsk", "0:/coco/bin" };
     char rom_path[128] = {0};
     bool have_rom = false;
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
         FILINFO fi;
-        // "0:/" always exists; only descend into the others if they're dirs.
-        if (i > 0 && !(f_stat(dirs[i], &fi) == FR_OK && (fi.fattrib & AM_DIR))) continue;
-        if (list_dir(dirs[i], rom_path, sizeof(rom_path))) { have_rom = true; break; }
+        if (!(f_stat(dirs[i], &fi) == FR_OK && (fi.fattrib & AM_DIR))) {
+            Serial.printf("(%s not present)\n", dirs[i]);
+            continue;
+        }
+        if (list_dir(dirs[i], rom_path, sizeof(rom_path))) have_rom = true;
     }
 
     if (have_rom) {
