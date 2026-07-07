@@ -138,6 +138,19 @@ void  *__psram_malloc(size_t);
 void   __psram_free(void *);
 void   psram_reinit_timing(uint32_t hz);
 
+// Disk BASIC cartridge ROM (FRUITJAM-29): executes at $C000, so it lives in
+// SRAM (hot path), unlike the bulk cassette image. Needs a 16 KB Extended+Color
+// main ROM (bas.rom) for Disk Extended Color BASIC to actually come up.
+static uint8_t g_cart[8192];
+static size_t load_cart_rom(const char *path) {
+    FIL f;
+    if (f_open(&f, path, FA_READ) != FR_OK) return 0;
+    UINT br = 0;
+    f_read(&f, g_cart, sizeof(g_cart), &br);
+    f_close(&f);
+    return br;
+}
+
 static const uint8_t *g_cas_img = nullptr;
 static size_t load_cas(const char *path) {
     FIL f;
@@ -466,6 +479,13 @@ void setup() {
         size_t cas = load_cas("0:/coco/tapes/AUTO.CAS");
         if (cas) { coco_machine_cas_load(g_cas_img, cas);
                    Serial.printf("[cassette AUTO.CAS loaded: %u bytes -> CLOAD to run] ", (unsigned)cas); }
+    }
+    // Optional Disk BASIC cartridge (FRUITJAM-29): needs a 16 KB Ext+Color main
+    // ROM to boot Disk Extended Color BASIC. Disk I/O (FDC engine) still TODO.
+    {
+        size_t dsk = load_cart_rom("0:/coco/roms/disk11.rom");
+        if (dsk) { coco_machine_load_cart(g_cart, dsk);
+                   Serial.printf("[disk cart: %u bytes] ", (unsigned)dsk); }
     }
     // Match the resampler cadence to our real-time pacing so the I2S ring neither
     // starves nor overflows (see coco_machine_audio_init).

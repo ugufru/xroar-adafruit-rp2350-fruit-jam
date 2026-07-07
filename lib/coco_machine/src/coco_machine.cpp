@@ -375,6 +375,50 @@ extern "C" void coco_machine_cas_eject(void) {
 
 extern "C" _Bool coco_machine_cas_motor(void) { return g_cas_motor; }
 
+// - - - disk cartridge: RSDOS + WD2797 (FRUITJAM-29, foundation) ---------------
+// RadioShack Disk BASIC cartridge. ROM at $C000-$DFFF; the WD2797 FDC and the
+// DSKREG control latch decode in the cartridge's $FF40-$FF5F slot:
+//   $FF40  DSKREG  (write): drive select (b0-2), motor (b3), density (b5),
+//                           NMI/HALT enable (b7) -- the CoCo's HALT-based data
+//                           transfer (signal_halt = halt_enable && !DRQ).
+//   $FF48  status (r) / command (w)   $FF49 track   $FF4A sector   $FF4B data
+// FOUNDATION ONLY: registers latch and status reports NOT READY (0x80), so Disk
+// BASIC boots to its prompt but disk ops fail cleanly. The FDC command engine
+// (restore/seek/step/read-sector/write-sector), the HALT/NMI wiring, and JVC
+// .dsk sector service are the remaining FRUITJAM-29 work.
+static const uint8_t *g_cart_rom = nullptr;
+static size_t   g_cart_len = 0;
+static uint8_t  g_dskreg   = 0;       // $FF40 control latch
+static uint8_t  g_fdc_track = 0, g_fdc_sector = 0, g_fdc_data = 0;
+
+// WD2797 status when idle with no disk mounted: bit7 = NOT READY.
+static const uint8_t FDC_STATUS_NOT_READY = 0x80;
+
+static inline uint8_t cart_io_read(uint16_t A) {
+    switch (A & 0x4B) {
+        case 0x48: return FDC_STATUS_NOT_READY;   // status (command engine: TODO)
+        case 0x49: return g_fdc_track;
+        case 0x4A: return g_fdc_sector;
+        case 0x4B: return g_fdc_data;
+        default:   return 0xFF;
+    }
+}
+static inline void cart_io_write(uint16_t A, uint8_t D) {
+    if (A == 0xFF40) { g_dskreg = D; return; }    // drive/motor/density/HALT-NMI
+    switch (A & 0x4B) {
+        case 0x48: /* command: FDC engine TODO */ break;
+        case 0x49: g_fdc_track  = D; break;
+        case 0x4A: g_fdc_sector = D; break;
+        case 0x4B: g_fdc_data   = D; break;
+        default: break;
+    }
+}
+
+extern "C" void coco_machine_load_cart(const uint8_t *rom, size_t len) {
+    g_cart_rom = rom; g_cart_len = len;
+    g_dskreg = 0;
+}
+
 // - - - bus -------------------------------------------------------------------
 
 // ROM read for the $8000-$BFFF window. 16 KB image: rom[A & 0x3FFF] covers both
@@ -396,8 +440,11 @@ extern "C" void HOT_FUNC(coco_mem_cycle)(void *sptr, _Bool RnW, uint16_t A) {
             g_m.cpu->D = g_ram[A];                       // RAM (or all-RAM mode)
         } else if (A < 0xC000) {
             g_m.cpu->D = rom_read(A);                    // Extended / Color BASIC
+        } else if (A < 0xE000) {                         // Disk BASIC cart ROM window
+            g_m.cpu->D = (g_cart_rom && (size_t)(A - 0xC000) < g_cart_len)
+                             ? g_cart_rom[A - 0xC000] : 0xFF;
         } else if (A < 0xFF00) {
-            g_m.cpu->D = 0xFF;                           // cart ROM window: absent
+            g_m.cpu->D = 0xFF;                           // $E000-$FEFF: absent
         } else if (A < 0xFF20) {
             g_m.cpu->D = mc6821_read(g_m.pia0, A);       // PIA0
             if ((A & 1) == 0) g_m.pia_irq_dirty = true;  // data read may clear IRQ
@@ -406,6 +453,8 @@ extern "C" void HOT_FUNC(coco_mem_cycle)(void *sptr, _Bool RnW, uint16_t A) {
             if ((A & 1) == 0) g_m.pia_irq_dirty = true;
         } else if (A >= 0xFFE0) {
             g_m.cpu->D = rom_read(A);                    // vectors live in Color BASIC ROM
+        } else if (g_cart_rom && A >= 0xFF40 && A <= 0xFF5F) {
+            g_m.cpu->D = cart_io_read(A);                // WD2797 FDC / DSKREG
         } else {
             g_m.cpu->D = 0xFF;                           // FF40-FFDF reads: open bus
         }
@@ -427,6 +476,8 @@ extern "C" void HOT_FUNC(coco_mem_cycle)(void *sptr, _Bool RnW, uint16_t A) {
                 if (A & 1) g_m.sam_f |=  (1u << bit);
                 else       g_m.sam_f &= ~(1u << bit);
             }
+        } else if (g_cart_rom && (A & 0xFFE0) == 0xFF40) {
+            cart_io_write(A, g_m.cpu->D);                 // WD2797 FDC / DSKREG
         } else if (A < 0x8000) {
             g_ram[A] = g_m.cpu->D;                        // RAM
         } else if (g_m.sam_ty && A < 0xFF00) {

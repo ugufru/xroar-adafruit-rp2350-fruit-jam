@@ -76,6 +76,15 @@ void coco_machine_audio_init(uint32_t cycles_per_field, uint32_t field_us);
 // field, after coco_machine_run_cycles.
 int coco_machine_render_audio(int16_t *out, int max);
 
+// - - - disk cartridge (FRUITJAM-29, in progress) -----------------------------
+// Map a RadioShack DOS / Disk BASIC cartridge ROM (typically disk11.rom, 8 KB)
+// into the cartridge window at $C000-$DFFF, so the CoCo boots Disk Extended
+// Color BASIC (requires a 16 KB Extended+Color main ROM). The WD2797 FDC decode
+// at $FF40-$FF5F is present but currently reports "not ready" — actual sector
+// I/O (the FDC command engine + .dsk) is the remaining FRUITJAM-29 work. Buffer
+// is caller-owned and must outlive the machine. Pass NULL/0 to remove the cart.
+void coco_machine_load_cart(const uint8_t *rom, size_t len);
+
 // - - - cassette (.cas) playback (FRUITJAM-28) --------------------------------
 // Load a .cas tape image (caller-owned buffer, must outlive playback) and let
 // the CoCo read it with CLOAD / CLOADM. Playback is event-driven and auto-gated
