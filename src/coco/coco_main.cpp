@@ -130,6 +130,30 @@ static size_t load_rom(const char *path) {
     return br;
 }
 
+// Cassette image (FRUITJAM-28): loaded from SD into PSRAM (the cold/bulk home,
+// FRUITJAM-08 policy) and handed to the machine's tape feeder. PSRAM is retuned
+// for 252 MHz in setup() (psram_reinit_timing) before this runs.
+extern size_t __psram_size;
+void  *__psram_malloc(size_t);
+void   __psram_free(void *);
+void   psram_reinit_timing(uint32_t hz);
+
+static const uint8_t *g_cas_img = nullptr;
+static size_t load_cas(const char *path) {
+    FIL f;
+    if (f_open(&f, path, FA_READ) != FR_OK) return 0;
+    size_t sz = f_size(&f);
+    if (sz == 0) { f_close(&f); return 0; }
+    uint8_t *buf = (uint8_t *)__psram_malloc(sz);
+    if (!buf) { f_close(&f); return 0; }
+    UINT br = 0;
+    f_read(&f, buf, sz, &br);
+    f_close(&f);
+    if (br != sz) { __psram_free(buf); return 0; }
+    g_cas_img = buf;
+    return sz;
+}
+
 // - - - CoCo audio -> TLV320 DAC over I2S (FRUITJAM-13) ------------------------
 // The machine produces 48 kHz mono PCM from its PIA sound tap (coco_machine
 // render_audio); this side is the sink: the TLV320DAC3100 configured over I2C0
@@ -379,6 +403,7 @@ void setup() {
     vreg_set_voltage(VREG_VOLTAGE_1_25);
     delay(2);
     set_sys_clock_khz(252000, true);
+    psram_reinit_timing(clock_get_hz(clk_sys));   // retune QMI PSRAM for 252 MHz (FRUITJAM-08)
 
     // Host 5V on early so the CH334F hub PHY settles before the host starts.
     pinMode(USB_5V_EN, OUTPUT);
@@ -436,6 +461,12 @@ void setup() {
 
     Serial.print("STAGE machine init... "); Serial.flush(); delay(20);
     if (!coco_machine_init(g_rom, got)) { Serial.println("FATAL: machine init"); while (1) delay(500); }
+    // Optional cassette: drop a .cas at 0:/coco/tapes/AUTO.CAS, then CLOAD in BASIC.
+    {
+        size_t cas = load_cas("0:/coco/tapes/AUTO.CAS");
+        if (cas) { coco_machine_cas_load(g_cas_img, cas);
+                   Serial.printf("[cassette AUTO.CAS loaded: %u bytes -> CLOAD to run] ", (unsigned)cas); }
+    }
     // Match the resampler cadence to our real-time pacing so the I2S ring neither
     // starves nor overflows (see coco_machine_audio_init).
     coco_machine_audio_init(CYCLES_PER_FRAME, FRAME_US);

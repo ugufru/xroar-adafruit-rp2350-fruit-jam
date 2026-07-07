@@ -287,6 +287,94 @@ extern "C" int coco_machine_render_audio(int16_t *out, int max) {
     return n;
 }
 
+// - - - cassette (.cas) playback (FRUITJAM-28) --------------------------------
+// A fresh, minimal .cas feeder (upstream tape.c wasn't vendored). The CoCo reads
+// tape via PIA1 PA0 (inverted): update path mirrors dragon.c's
+// update_audio_from_tape -> tape "high" pulls PA0 low. Playback is a stream of
+// half-cycle pulses driven by a machine event, gated by the motor relay
+// (PIA1 CA2). Each bit is two pulses (low then high); the full-cycle width is
+// bit0 (~1100 Hz) or bit1 (~2050 Hz) per XRoar's empirical CoCo values, in the
+// 14318180 Hz event-tick base.  cw = {203,109} CAS-samples * 64; pulse = cw/2.
+static const int CAS_BIT0_PULSE = (203 * 64) >> 1;   // 6496 ticks, "0" half-cycle
+static const int CAS_BIT1_PULSE = (109 * 64) >> 1;   // 3488 ticks, "1" half-cycle
+static const int CAS_LEADER_BYTES = 128;             // synthesised 0x55 sync leader
+
+static const uint8_t *g_cas_buf   = nullptr;
+static size_t   g_cas_len   = 0;
+static size_t   g_cas_byte  = 0;     // index into the image
+static int      g_cas_lead  = 0;     // leader bytes remaining
+static int      g_cas_bit   = 0;     // 0..7, LSB first
+static int      g_cas_phase = 0;     // 0/1 : two pulses per bit
+static bool     g_cas_playing = false;
+static bool     g_cas_motor   = false;
+static struct event g_cas_event;
+
+// Drive the cassette input pin (PIA1 PA0), inverted like the real comparator.
+static inline void cas_set_input(int level) {
+    if (!g_m.pia1) return;
+    if (level) g_m.pia1->a.in_sink &= ~0x01u;   // tape high -> PA0 low
+    else       g_m.pia1->a.in_sink |=  0x01u;   // tape low  -> PA0 high
+}
+
+static inline bool cas_at_end(void) {
+    return g_cas_lead == 0 && g_cas_byte >= g_cas_len;
+}
+
+// One half-cycle: set PA0 for this pulse, advance the bit/byte cursor, re-arm.
+extern "C" void coco_cas_waggle(void *sptr) {
+    (void)sptr;
+    if (!g_cas_playing || !g_cas_motor) return;
+    if (cas_at_end()) { g_cas_playing = false; return; }
+
+    uint8_t b = (g_cas_lead > 0) ? 0x55 : g_cas_buf[g_cas_byte];
+    int bit   = (b >> g_cas_bit) & 1;
+    int pulse = bit ? CAS_BIT1_PULSE : CAS_BIT0_PULSE;
+
+    cas_set_input(g_cas_phase);          // phase 0 -> low pulse, phase 1 -> high pulse
+    g_cas_phase ^= 1;
+    if (g_cas_phase == 0) {              // finished both pulses of this bit
+        if (++g_cas_bit == 8) {
+            g_cas_bit = 0;
+            if (g_cas_lead > 0) g_cas_lead--; else g_cas_byte++;
+        }
+    }
+    event_queue_dt(&g_cas_event, pulse);
+}
+
+// PIA1 CA2 = cassette motor relay. Start/resume playback while it's energised.
+extern "C" void coco_pia1a_control_postwrite(void *sptr) {
+    (void)sptr;
+    if (!g_m.pia1) return;
+    bool motor = PIA_VALUE_CA2(g_m.pia1);
+    if (motor && !g_cas_motor) {
+        g_cas_motor = true;
+        if (g_cas_playing && !event_queued(&g_cas_event))
+            event_queue_dt(&g_cas_event, 1);
+    } else if (!motor && g_cas_motor) {
+        g_cas_motor = false;
+        event_dequeue(&g_cas_event);     // pause; position is preserved
+    }
+}
+
+extern "C" _Bool coco_machine_cas_load(const uint8_t *cas, size_t len) {
+    if (!cas || len == 0) return 0;
+    g_cas_buf = cas; g_cas_len = len;
+    g_cas_byte = 0; g_cas_bit = 0; g_cas_phase = 0;
+    g_cas_lead = CAS_LEADER_BYTES;
+    g_cas_playing = true;
+    if (g_cas_motor && !event_queued(&g_cas_event))
+        event_queue_dt(&g_cas_event, 1);
+    return 1;
+}
+
+extern "C" void coco_machine_cas_eject(void) {
+    g_cas_playing = false;
+    g_cas_buf = nullptr; g_cas_len = 0;
+    event_dequeue(&g_cas_event);
+}
+
+extern "C" _Bool coco_machine_cas_motor(void) { return g_cas_motor; }
+
 // - - - bus -------------------------------------------------------------------
 
 // ROM read for the $8000-$BFFF window. 16 KB image: rom[A & 0x3FFF] covers both
@@ -420,6 +508,11 @@ extern "C" _Bool coco_machine_init(const uint8_t *rom, size_t rom_len) {
     if (!machine_event_list_global) return 0;
     event_current_tick = 0;
 
+    // Cassette playback event + fresh tape state (FRUITJAM-28).
+    event_init(&g_cas_event, MACHINE_EVENT_LIST, DELEGATE_AS0(void, coco_cas_waggle, NULL));
+    g_cas_playing = false; g_cas_motor = false;
+    g_cas_buf = nullptr;   g_cas_len = 0;
+
     struct part *p;
 
     p = part_create("MC6809", NULL);
@@ -453,6 +546,8 @@ extern "C" _Bool coco_machine_init(const uint8_t *rom, size_t rom_len) {
     // Audio tap (FRUITJAM-13): DAC on port A, mux-enable on CB2.
     g_m.pia1->a.data_postwrite    = DELEGATE_AS0(void, coco_pia1a_postwrite, NULL);
     g_m.pia1->b.control_postwrite = DELEGATE_AS0(void, coco_pia1b_control_postwrite, NULL);
+    // Cassette motor relay on PIA1 CA2 (FRUITJAM-28).
+    g_m.pia1->a.control_postwrite = DELEGATE_AS0(void, coco_pia1a_control_postwrite, NULL);
 
     // CoCo 2 ships the 6847T1 (lowercase via inverse bit). The non-T1 font path
     // in mc6847.c is then dead at runtime (font_6847[] is a link-time stub).

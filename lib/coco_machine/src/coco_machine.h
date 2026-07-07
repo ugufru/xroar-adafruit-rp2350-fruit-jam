@@ -76,6 +76,17 @@ void coco_machine_audio_init(uint32_t cycles_per_field, uint32_t field_us);
 // field, after coco_machine_run_cycles.
 int coco_machine_render_audio(int16_t *out, int max);
 
+// - - - cassette (.cas) playback (FRUITJAM-28) --------------------------------
+// Load a .cas tape image (caller-owned buffer, must outlive playback) and let
+// the CoCo read it with CLOAD / CLOADM. Playback is event-driven and auto-gated
+// by the emulated cassette motor relay (PIA1 CA2), exactly like real hardware:
+// just load the image, then CLOAD in BASIC and the tape "plays" while the motor
+// runs. A short 0x55 leader is synthesised ahead of the image so the ROM's tape
+// routine can sync even if the file omits one. Returns true if accepted.
+_Bool coco_machine_cas_load(const uint8_t *cas, size_t len);
+void  coco_machine_cas_eject(void);
+_Bool coco_machine_cas_motor(void);   // diagnostic: cassette motor relay state
+
 // Keyboard injection by XRoar DSCAN_* code (see xroar_core dkbd.h). All keys
 // released at init. FRUITJAM-12 maps USB HID onto this.
 void coco_machine_press_key(uint8_t dscan);
