@@ -375,48 +375,197 @@ extern "C" void coco_machine_cas_eject(void) {
 
 extern "C" _Bool coco_machine_cas_motor(void) { return g_cas_motor; }
 
-// - - - disk cartridge: RSDOS + WD2797 (FRUITJAM-29, foundation) ---------------
-// RadioShack Disk BASIC cartridge. ROM at $C000-$DFFF; the WD2797 FDC and the
-// DSKREG control latch decode in the cartridge's $FF40-$FF5F slot:
-//   $FF40  DSKREG  (write): drive select (b0-2), motor (b3), density (b5),
-//                           NMI/HALT enable (b7) -- the CoCo's HALT-based data
-//                           transfer (signal_halt = halt_enable && !DRQ).
-//   $FF48  status (r) / command (w)   $FF49 track   $FF4A sector   $FF4B data
-// FOUNDATION ONLY: registers latch and status reports NOT READY (0x80), so Disk
-// BASIC boots to its prompt but disk ops fail cleanly. The FDC command engine
-// (restore/seek/step/read-sector/write-sector), the HALT/NMI wiring, and JVC
-// .dsk sector service are the remaining FRUITJAM-29 work.
+// - - - disk cartridge: RSDOS + WD2797 sector-level FDC (FRUITJAM-29) -----------
+// RadioShack Disk BASIC cartridge. ROM at $C000-$DFFF. In the $FF40-$FF5F slot:
+//   $FF40-47 DSKREG (write): drive (b0-2,b6), motor (b3), density (b5),
+//                            HALT/NMI enable (b7)
+//   $FF48-4F WD2797 (A&3):   0 status/command, 1 track, 2 sector, 3 data
+// A JVC .dsk is raw sectors (no rotation/gap/IDAM), so the FDC works at whole-
+// sector granularity. The CoCo HALT-based transfer: with b7 set the CPU is
+// halted (it still runs NVMA cycles, so events advance) and the FDC releases it
+// one byte at a time via DRQ; INTRQ -> NMI on completion (halt auto-clears).
 static const uint8_t *g_cart_rom = nullptr;
 static size_t   g_cart_len = 0;
-static uint8_t  g_dskreg   = 0;       // $FF40 control latch
-static uint8_t  g_fdc_track = 0, g_fdc_sector = 0, g_fdc_data = 0;
 
-// WD2797 status when idle with no disk mounted: bit7 = NOT READY.
-static const uint8_t FDC_STATUS_NOT_READY = 0x80;
+// Mounted JVC .dsk (mutable buffer for write-back; writes are not persisted to
+// the SD card yet -- they live in the in-RAM/PSRAM copy).
+static uint8_t *g_dsk = nullptr;
+static size_t   g_dsk_len = 0;
+static uint32_t g_dsk_hdr = 0;
+static int      g_dsk_spt = 18, g_dsk_sides = 1, g_dsk_secsz = 256, g_dsk_base = 1;
+static bool     g_dsk_wp = false;
 
-static inline uint8_t cart_io_read(uint16_t A) {
-    switch (A & 0x4B) {
-        case 0x48: return FDC_STATUS_NOT_READY;   // status (command engine: TODO)
-        case 0x49: return g_fdc_track;
-        case 0x4A: return g_fdc_sector;
-        case 0x4B: return g_fdc_data;
-        default:   return 0xFF;
-    }
+// WD2797 registers + transfer state.
+static uint8_t  g_fdc_status = 0, g_fdc_track = 0, g_fdc_sector = 0, g_fdc_data = 0;
+static bool     g_fdc_drq = false, g_fdc_intrq = false, g_fdc_writing = false, g_fdc_type1 = false;
+static bool     g_halt_enable = false;
+static int      g_fdc_drive = 0, g_fdc_side = 0, g_fdc_stepdir = 1;
+static uint8_t  g_fdc_buf[256];
+static int      g_fdc_idx = 0, g_fdc_count = 0;
+static struct event g_fdc_event;
+
+enum { ST_BUSY=0x01, ST_DRQ=0x02, ST_LOST=0x04, ST_CRC=0x08,
+       ST_RNF=0x10, ST_WP=0x40, ST_NR=0x80, ST_TRK0=0x04 };
+static const int FDC_CMD_TICKS  = 800;   // command setup / seek settle
+static const int FDC_BYTE_TICKS = 400;   // ~28 us per transferred byte
+
+static inline void fdc_halt(void) {
+    if (g_m.cpu) g_m.cpu->halt = (g_halt_enable && !g_fdc_drq) ? 1 : 0;
 }
-static inline void cart_io_write(uint16_t A, uint8_t D) {
-    if (A == 0xFF40) { g_dskreg = D; return; }    // drive/motor/density/HALT-NMI
-    switch (A & 0x4B) {
-        case 0x48: /* command: FDC engine TODO */ break;
-        case 0x49: g_fdc_track  = D; break;
-        case 0x4A: g_fdc_sector = D; break;
-        case 0x4B: g_fdc_data   = D; break;
-        default: break;
+
+static inline long dsk_offset(int track, int side, int sector) {
+    if (!g_dsk) return -1;
+    if (sector < g_dsk_base || sector >= g_dsk_base + g_dsk_spt) return -1;
+    long lsn = ((long)track * g_dsk_sides + side) * g_dsk_spt + (sector - g_dsk_base);
+    long off = (long)g_dsk_hdr + lsn * g_dsk_secsz;
+    if (off < 0 || off + g_dsk_secsz > (long)g_dsk_len) return -1;
+    return off;
+}
+
+static void fdc_finish(void) {
+    if (g_fdc_writing && g_dsk && !g_dsk_wp) {
+        long off = dsk_offset(g_fdc_track, g_fdc_side, g_fdc_sector);
+        if (off >= 0) memcpy(g_dsk + off, g_fdc_buf, g_dsk_secsz);
+    }
+    g_fdc_status = g_fdc_type1 ? (uint8_t)((g_fdc_track == 0) ? ST_TRK0 : 0)
+                              : (uint8_t)(g_fdc_status & ~(ST_BUSY | ST_DRQ));
+    g_fdc_drq = false;
+    bool nmi = g_halt_enable;
+    g_halt_enable = false;                 // auto-cleared on completion (rsdos)
+    g_fdc_intrq = true;
+    if (g_m.cpu) { g_m.cpu->halt = 0; g_m.cpu->nmi = nmi ? 1 : 0; }
+    event_dequeue(&g_fdc_event);
+}
+
+// Present (read) or request (write) the next transfer byte, or finish.
+extern "C" void coco_fdc_event(void *sptr) {
+    (void)sptr;
+    if (g_fdc_idx < g_fdc_count) {
+        if (!g_fdc_writing) g_fdc_data = g_fdc_buf[g_fdc_idx];
+        g_fdc_drq = true;
+        g_fdc_status |= ST_DRQ;
+        fdc_halt();                        // release HALT so the CPU takes the byte
+        return;                            // next byte scheduled on the CPU's data access
+    }
+    fdc_finish();
+}
+
+static void fdc_command(uint8_t cmd) {
+    uint8_t top = cmd >> 4;
+    g_fdc_intrq = false;
+    if (g_m.cpu) g_m.cpu->nmi = 0;
+
+    if (top == 0x0D) {                     // Force Interrupt
+        g_fdc_status &= ~(ST_BUSY | ST_DRQ);
+        g_fdc_drq = false; event_dequeue(&g_fdc_event);
+        if (cmd & 0x08) g_fdc_intrq = true;
+        fdc_halt();
+        return;
+    }
+    if (!g_dsk) { g_fdc_status = ST_NR; g_fdc_intrq = true; fdc_halt(); return; }
+
+    g_fdc_type1 = (top <= 0x07);
+    if (g_fdc_type1) {                     // Type I: head positioning
+        switch (top) {
+            case 0x00: g_fdc_track = 0; break;                                     // Restore
+            case 0x01: g_fdc_track = g_fdc_data; break;                            // Seek
+            case 0x02: case 0x03: g_fdc_track += g_fdc_stepdir; break;             // Step
+            case 0x04: case 0x05: g_fdc_stepdir = 1;  g_fdc_track++; break;        // Step-in
+            case 0x06: case 0x07: g_fdc_stepdir = -1; if (g_fdc_track) g_fdc_track--; break; // Step-out
+        }
+        g_fdc_status = ST_BUSY;
+        g_fdc_idx = g_fdc_count = 0;        // no data transfer
+        event_queue_dt(&g_fdc_event, FDC_CMD_TICKS);
+        return;
+    }
+    if (top == 0x08 || top == 0x09) {      // Read Sector
+        long off = dsk_offset(g_fdc_track, g_fdc_side, g_fdc_sector);
+        if (off < 0) { g_fdc_status = ST_RNF; g_fdc_intrq = true; fdc_halt(); return; }
+        memcpy(g_fdc_buf, g_dsk + off, g_dsk_secsz);
+        g_fdc_idx = 0; g_fdc_count = g_dsk_secsz; g_fdc_writing = false;
+        g_fdc_status = ST_BUSY;
+        event_queue_dt(&g_fdc_event, FDC_CMD_TICKS);
+        return;
+    }
+    if (top == 0x0A || top == 0x0B) {      // Write Sector
+        long off = dsk_offset(g_fdc_track, g_fdc_side, g_fdc_sector);
+        if (off < 0)    { g_fdc_status = ST_RNF; g_fdc_intrq = true; fdc_halt(); return; }
+        if (g_dsk_wp)   { g_fdc_status = ST_WP;  g_fdc_intrq = true; fdc_halt(); return; }
+        g_fdc_idx = 0; g_fdc_count = g_dsk_secsz; g_fdc_writing = true;
+        g_fdc_status = ST_BUSY;
+        event_queue_dt(&g_fdc_event, FDC_CMD_TICKS);
+        return;
+    }
+    // Read Address / Read Track / Write Track (format): not needed for DIR/LOAD/RUN.
+    g_fdc_status = ST_RNF; g_fdc_intrq = true; fdc_halt();
+}
+
+static void dskreg_write(uint8_t D) {
+    if      (D & 0x01) g_fdc_drive = 0;
+    else if (D & 0x02) g_fdc_drive = 1;
+    else if (D & 0x04) g_fdc_drive = 2;
+    else if (D & 0x40) g_fdc_drive = 3;
+    g_fdc_side = 0;                         // RSDOS CoCo controller is single-sided
+    g_halt_enable = (D & 0x80) && !g_fdc_intrq;
+    fdc_halt();
+}
+
+static uint8_t cart_io_read(uint16_t A) {
+    if (A & 0x08) {                        // WD2797
+        switch (A & 3) {
+            case 0: g_fdc_intrq = false; if (g_m.cpu) g_m.cpu->nmi = 0; return g_fdc_status;
+            case 1: return g_fdc_track;
+            case 2: return g_fdc_sector;
+            default: {                     // data: advance a read transfer
+                uint8_t v = g_fdc_data;
+                if (!g_fdc_writing && g_fdc_drq) {
+                    g_fdc_drq = false; g_fdc_status &= ~ST_DRQ; fdc_halt();
+                    if (++g_fdc_idx < g_fdc_count) event_queue_dt(&g_fdc_event, FDC_BYTE_TICKS);
+                    else fdc_finish();
+                }
+                return v;
+            }
+        }
+    }
+    return 0xFF;                           // DSKREG is write-only
+}
+
+static void cart_io_write(uint16_t A, uint8_t D) {
+    if (A & 0x08) {                        // WD2797
+        switch (A & 3) {
+            case 0: fdc_command(D); break;
+            case 1: g_fdc_track  = D; break;
+            case 2: g_fdc_sector = D; break;
+            default:                       // data: advance a write transfer
+                g_fdc_data = D;
+                if (g_fdc_writing && g_fdc_drq) {
+                    g_fdc_buf[g_fdc_idx] = D;
+                    g_fdc_drq = false; g_fdc_status &= ~ST_DRQ; fdc_halt();
+                    if (++g_fdc_idx < g_fdc_count) event_queue_dt(&g_fdc_event, FDC_BYTE_TICKS);
+                    else fdc_finish();
+                }
+                break;
+        }
+    } else {
+        dskreg_write(D);
     }
 }
 
 extern "C" void coco_machine_load_cart(const uint8_t *rom, size_t len) {
     g_cart_rom = rom; g_cart_len = len;
-    g_dskreg = 0;
+}
+
+extern "C" void coco_machine_mount_dsk(uint8_t *buf, size_t len) {
+    g_dsk = buf; g_dsk_len = len;
+    // JVC header = len % 256 bytes (0 for a plain 35-track single-sided image).
+    g_dsk_hdr = (uint32_t)(len % 256);
+    g_dsk_spt = 18; g_dsk_sides = 1; g_dsk_secsz = 256; g_dsk_base = 1;
+    if (buf) {
+        if (g_dsk_hdr >= 1 && buf[0]) g_dsk_spt   = buf[0];
+        if (g_dsk_hdr >= 2 && buf[1]) g_dsk_sides = buf[1];
+        if (g_dsk_hdr >= 4)           g_dsk_base  = buf[3];
+    }
+    g_dsk_wp = false;
 }
 
 // - - - bus -------------------------------------------------------------------
@@ -563,6 +712,10 @@ extern "C" _Bool coco_machine_init(const uint8_t *rom, size_t rom_len) {
     event_init(&g_cas_event, MACHINE_EVENT_LIST, DELEGATE_AS0(void, coco_cas_waggle, NULL));
     g_cas_playing = false; g_cas_motor = false;
     g_cas_buf = nullptr;   g_cas_len = 0;
+
+    // WD2797 FDC transfer event + fresh disk state (FRUITJAM-29).
+    event_init(&g_fdc_event, MACHINE_EVENT_LIST, DELEGATE_AS0(void, coco_fdc_event, NULL));
+    g_fdc_status = 0; g_fdc_drq = false; g_fdc_intrq = false; g_halt_enable = false;
 
     struct part *p;
 

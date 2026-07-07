@@ -98,6 +98,12 @@ void coco_machine_exec(uint16_t addr);
 // is caller-owned and must outlive the machine. Pass NULL/0 to remove the cart.
 void coco_machine_load_cart(const uint8_t *rom, size_t len);
 
+// Mount a JVC .dsk image so Disk BASIC can DIR/LOAD/RUN from it. The buffer is
+// caller-owned and MUTABLE (sector writes go into it; not yet persisted to SD).
+// Geometry comes from the JVC header, else defaults (single-sided, 18 sectors,
+// 256-byte, sector base 1). Pass NULL/0 to unmount.
+void coco_machine_mount_dsk(uint8_t *buf, size_t len);
+
 // - - - cassette (.cas) playback (FRUITJAM-28) --------------------------------
 // Load a .cas tape image (caller-owned buffer, must outlive playback) and let
 // the CoCo read it with CLOAD / CLOADM. Playback is event-driven and auto-gated

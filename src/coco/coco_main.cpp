@@ -503,6 +503,15 @@ void setup() {
         if (dsk) { coco_machine_load_cart(g_cart, dsk);
                    Serial.printf("[disk cart: %u bytes] ", (unsigned)dsk); }
     }
+    // Optional disk: mount a JVC .dsk (DIR/LOAD/RUN). AUTO.DSK preferred, else
+    // fall back to coco.dsk for a first test. Mutable PSRAM buffer for writes.
+    {
+        const uint8_t *dsk_img = nullptr;
+        size_t dsk = load_psram_file("0:/coco/dsk/AUTO.DSK", &dsk_img);
+        if (!dsk) dsk = load_psram_file("0:/coco/roms/coco.dsk", &dsk_img);
+        if (dsk) { coco_machine_mount_dsk((uint8_t *)dsk_img, dsk);
+                   Serial.printf("[disk mounted: %u bytes -> DIR/LOAD] ", (unsigned)dsk); }
+    }
     // Optional: drop a DECB .bin at 0:/coco/bin/AUTO.BIN to auto-run it on boot.
     g_bin_len = load_psram_file("0:/coco/bin/AUTO.BIN", &g_bin_img);
     if (g_bin_len) Serial.printf("[AUTO.BIN queued: %u bytes -> auto-EXEC after boot] ",
