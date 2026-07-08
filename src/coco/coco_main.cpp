@@ -431,6 +431,11 @@ void setup() {
     pinMode(USB_5V_EN, OUTPUT);
     digitalWrite(USB_5V_EN, HIGH);
 
+    // Onboard LED (GPIO29, active-low) doubles as the FRUITJAM-35 per-core
+    // liveness heartbeat driven from loop(). Not using the shared IR receiver.
+    pinMode(PIN_LED, OUTPUT);
+    digitalWrite(PIN_LED, HIGH);   // off (active-low)
+
     Serial.begin(115200);
     const uint32_t start = millis();
     while (!Serial && (millis() - start) < 1500) delay(10);
@@ -599,23 +604,59 @@ void loop() {
         uint32_t vf = video_frame_count;
         uint32_t fps = (last_ms && now_ms > last_ms) ? (vf - last_vf) * 1000 / (now_ms - last_ms) : 0;
 
-        Serial.printf("emu %lu fields, avg run %lu us/field (%lu.%02lux real-time), video_frames=%lu (%lu fps), audio_peak=%d/32767\n",
-                      (unsigned long)frames,
-                      (unsigned long)(run_us_acc / (frames - last_report)),
-                      (unsigned long)(FRAME_US * (frames - last_report) / run_us_acc),
-                      (unsigned long)((uint64_t)FRAME_US * (frames - last_report) * 100 / run_us_acc % 100),
-                      (unsigned long)vf, (unsigned long)fps, g_audio_peak);
-        if (g_resync_count) Serial.printf("  (resyncs so far: %lu)\n", (unsigned long)g_resync_count);
+        // Guard every serial write so a connected-but-not-draining (or absent)
+        // USB CDC host can never block core 0 in a full-TX-FIFO write — the
+        // leading FRUITJAM-35 freeze suspect (KALEIDSC ran 2h40m clean *with* a
+        // monitor draining serial). availableForWrite() is the free TX FIFO
+        // byte count; if the whole line won't fit we drop the report rather than
+        // stall the emulator. The fps/desync LOGIC below still runs regardless.
+        if (Serial && Serial.availableForWrite() >= 160) {
+            Serial.printf("emu %lu fields, avg run %lu us/field (%lu.%02lux real-time), video_frames=%lu (%lu fps), audio_peak=%d/32767\n",
+                          (unsigned long)frames,
+                          (unsigned long)(run_us_acc / (frames - last_report)),
+                          (unsigned long)(FRAME_US * (frames - last_report) / run_us_acc),
+                          (unsigned long)((uint64_t)FRAME_US * (frames - last_report) * 100 / run_us_acc % 100),
+                          (unsigned long)vf, (unsigned long)fps, g_audio_peak);
+            if (g_resync_count && Serial.availableForWrite() >= 40)
+                Serial.printf("  (resyncs so far: %lu)\n", (unsigned long)g_resync_count);
+        }
         g_audio_peak = 0;
 
         // Desync watchdog: a healthy 60p link advances ~60 fps. If frames race
         // (>90 fps) the HSTX stream has desynced (FIFO underran) — restart it.
         if (last_ms && fps > 90) {
             g_want_resync = true;   // core 1 performs the resync safely (see core1_background)
-            Serial.println("  ! HSTX desync detected -> resync requested (core1)");
+            if (Serial && Serial.availableForWrite() >= 64)
+                Serial.println("  ! HSTX desync detected -> resync requested (core1)");
         }
         last_vf = vf; last_ms = now_ms;
         last_report = frames; run_us_acc = 0;
     }
+
+    // --- per-core liveness heartbeat (FRUITJAM-35) ---------------------------
+    // Diagnose a freeze with NO serial host attached. Core 0 toggles the onboard
+    // LED (GPIO29, active-low) from here, so if this loop stalls the LED FREEZES.
+    // The blink RATE encodes core-1 health, read from video_frame_count (bumped
+    // by the core-1 video engine):
+    //   slow blink (~2 Hz) -> both cores alive
+    //   fast blink (~8 Hz) -> core 0 alive but core 1 (video) stalled
+    //   frozen LED         -> core 0 hung (e.g. blocked in a USB CDC write)
+    {
+        static uint32_t hb_vf = 0, hb_eval = 0, hb_toggle = 0;
+        static bool     hb_c1_ok = true, hb_on = false;
+        uint32_t now = millis();
+        if (now - hb_eval >= 250) {                  // re-check core-1 liveness 4x/s
+            uint32_t vf = video_frame_count;
+            hb_c1_ok = (vf != hb_vf);
+            hb_vf = vf; hb_eval = now;
+        }
+        uint32_t period = hb_c1_ok ? 250 : 60;       // healthy slow vs core1-stalled fast
+        if (now - hb_toggle >= period) {
+            hb_on = !hb_on;
+            digitalWrite(PIN_LED, hb_on ? LOW : HIGH);   // active-low: LOW = lit
+            hb_toggle = now;
+        }
+    }
+
     delay(1);   // yield so the USB CDC task runs (serial + 1200-baud reset)
 }

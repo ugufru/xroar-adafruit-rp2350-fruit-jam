@@ -7,3 +7,6 @@ adafruit-fruit-jam.pdf
 # macOS
 .DS_Store
 ._*
+
+# Serial capture logs from diagnostic runs (FRUITJAM-35)
+*.log
