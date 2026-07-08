@@ -6,10 +6,12 @@ an RP2350B-based "credit card sized" mini computer with DVI video, USB host, and
 
 The port targets the **latest XRoar release (1.11)**.
 
-**Status: planning.** No port code yet. Prior experience comes from three proof-of-concept XRoar
-ports to Waveshare RP2350 boards; this repo starts fresh from that experience — it is a new port,
-not a copy of any of them. The next step is identifying and prioritizing the work as tracked
-issues before any coding starts.
+**Status: it boots and runs.** Color BASIC, Extended Color BASIC, and Disk Extended Color BASIC
+all come up on real hardware — DVI video on a monitor, a USB keyboard through the onboard hub,
+sound through the headphone jack, and programs loaded from a microSD card (including `DIR` /
+`LOAD` / `RUN` off a `.dsk` floppy image). The emulator runs at authentic CoCo speed (~0.895 MHz
+6809) with headroom to spare. Remaining work is polish and stretch features — see
+[Status](#status) and the tracked issues.
 
 ## About the Fruit Jam
 
@@ -40,25 +42,92 @@ one internal contradiction — the SD pin listing gives GPIO34 for both SD_SCK a
 against the schematic: **card-detect is GPIO33** (GPIO34 is SD_SCK), and the otherwise-unlisted
 **PSRAM chip-select is GPIO47**.
 
+## Status
+
+| Area | State | Notes |
+|---|---|---|
+| HSTX DVI video | ✅ working | 640×480p60; 320×240 RGB565 framebuffer, CoCo 256×192 centered, hardware pixel-doubled |
+| Emulation core | ✅ working | XRoar 1.11 (6809, SAM, PIA×2, VDG) vendored fresh from upstream |
+| Color / Extended / Disk BASIC | ✅ working | boots to the prompt at authentic speed |
+| USB keyboard | ✅ working | HID boot protocol through the CH334F hub (either USB-A port) |
+| Audio (TLV320 DAC) | ✅ working | CoCo `SOUND` audible on the 3.5 mm headphone jack over I2S |
+| microSD | ✅ working | SPI + FatFS; ROMs and disk/cassette images loaded from a FAT32 card |
+| Disk (`.dsk`) | ✅ working | WD2797 FDC + Disk BASIC cartridge; `DIR` / `LOAD` / `LOADM` / `RUN` off a JVC image |
+| Cassette (`.cas`) | 🚧 in progress | fresh FSK feeder → PIA1 for `CLOAD` (FRUITJAM-28) |
+| PSRAM (8 MB) | ✅ working | cold/bulk only (disk images, snapshots); kept out of the per-frame hot path |
+| Performance | ✅ locked | ~1.3× real-time idle, ~1.04× under heavy load, steady 59–60 fps |
+| Buttons / NeoPixels | ⬜ planned | board UI (FRUITJAM-16) |
+| Cassette **audio** (`.wav`/`.aiff`) | ⬜ planned | hear a tape via `MOTOR`/`AUDIO` (FRUITJAM-30) |
+| USB joystick / gamepad | ⬜ planned | FRUITJAM-18 |
+| HDMI audio (HSTX data islands) | ⬜ stretch | second audio sink alongside the DAC (FRUITJAM-14) |
+
+**Operating point:** 252 MHz system clock at 1.25 V core; `clk_hstx` = 126 MHz (FRUITJAM-03).
+252 MHz divides exactly for PIO-USB and serves HSTX 480p with room left for emulation.
+
+**Known issues:**
+- `mount_sd()` can hang on a loose / unresponsive microSD instead of timing out — reseat the card
+  (FRUITJAM-26).
+- A rare lockup after long runs of a heavy program (KALEIDSC) is under investigation
+  (FRUITJAM-35); a non-blocking-serial fix and an on-board per-core heartbeat LED are in place to
+  pin it down.
+
+## Build and run
+
+Built with [PlatformIO](https://platformio.org/) against the
+[earlephilhower arduino-pico](https://github.com/earlephilhower/arduino-pico) core (the Fruit Jam
+has official BSP support there). The integration firmware is the `coco` environment:
+
+```sh
+# Build
+pio run -e coco
+
+# Flash: hold BOOT, tap reset to enter the UF2 bootloader, then either
+pio run -e coco -t upload
+#   ...or drag .pio/build/coco/firmware.uf2 onto the RPI-RP2 drive.
+
+# Watch the serial log (boot stages + per-field performance)
+pio device monitor -b 115200
+```
+
+There are also smaller single-purpose environments for hardware bring-up and regression
+(`display`, `sdtest`, `audiotest`, `psram`, `usbkbd`, `clockprobe`, `smoke`, `cocoboot`) — see
+`platformio.ini`.
+
+## SD card layout
+
+A FAT32 microSD supplies the ROMs and any disk/cassette/binary images. ROMs are **not** included
+(source them yourself). Expected paths:
+
+```
+0:/coco/roms/bas12.rom      Color BASIC 1.2 (8K)          — required
+0:/coco/roms/extbas11.rom   Extended Color BASIC 1.1 (8K) — enables Extended (16K Ext+Color)
+0:/coco/roms/disk11.rom     Disk Extended Color BASIC     — enables the disk cartridge at $C000
+0:/coco/dsk/AUTO.DSK        JVC .dsk floppy image, auto-mounted (falls back to roms/coco.dsk)
+0:/coco/tapes/AUTO.CAS      cassette image for CLOAD
+0:/coco/bin/AUTO.BIN        DECB .bin, auto-EXEC'd on boot
+```
+
+With just `bas12.rom` you get plain Color BASIC; add `extbas11.rom` for Extended; add
+`disk11.rom` + a `.dsk` for Disk BASIC.
+
 ## Why this board is interesting for XRoar
 
-Compared with the three Waveshare boards already explored, the Fruit Jam changes the porting
-calculus in four ways:
+Compared with the three Waveshare boards previously explored, the Fruit Jam changed the porting
+calculus in four ways — all now validated on hardware:
 
 - **HSTX hardware DVI.** The RP2350's High-Speed Transmit peripheral drives the DVI port directly
-  — no PIO TMDS bit-banging, no libdvi CPU/PIO cost as on the Pi-Zero-form-factor port. How the
-  HSTX clock relates to the system clock (and therefore how much overclock headroom remains for
-  emulation) is a key research item.
+  — no PIO TMDS bit-banging, no libdvi CPU/PIO cost as on the Pi-Zero-form-factor port. Scanout is
+  near-zero CPU (hardware serializer + DMA + a per-scanline pointer callback), which frees core 1
+  and leaves generous overclock headroom for emulation. See [`docs/display-hstx.md`](docs/display-hstx.md).
 - **A real audio path.** The TLV320DAC3100 I2S DAC (configured over I2C) is the first target board
-  with proper audio hardware — earlier ports ended at a null audio sink or HDMI audio
-  experiments. This board can finally give the CoCo its voice through a real DAC.
-- **PSRAM is populated (8 MB).** Earlier porting work established that PSRAM must stay out of the
-  per-frame hot path, but as cold/bulk storage (ROM images, cassette/disk images, snapshots) it is
-  a real asset the Waveshare pizero board simply didn't have.
+  with proper audio hardware — earlier ports ended at a null audio sink or HDMI audio experiments.
+  The CoCo now speaks through a real DAC.
+- **PSRAM is populated (8 MB).** It stays out of the per-frame hot path, but as cold/bulk storage
+  (disk/cassette images, snapshots) it is a real asset the Waveshare pizero board lacked. Policy in
+  [`docs/psram-policy.md`](docs/psram-policy.md).
 - **USB host behind a hub.** Keyboard input arrives via PIO-USB (GPIO1/2) through an onboard
-  CH334F 3-port hub. PIO-USB historically pins the system clock to exactly 120 or 240 MHz, and
-  hub + full-speed-only behaviour needs verification — this constraint interacts directly with
-  the HSTX clocking question above.
+  CH334F 3-port hub — TinyUSB hub support (`CFG_TUH_HUB`) that no prior port had needed. USB is
+  full-speed only; simple wired keyboards and 2.4 GHz dongles enumerate.
 
 ## Approach and prior art
 
@@ -68,17 +137,21 @@ calculus in four ways:
   boards — a 4.3" parallel-RGB LCD, a Pi-Zero form factor driving HDMI via PIO, and a 1.8" QSPI
   AMOLED. They established the RP2350 porting playbook: keep the emulation hot loop in SRAM,
   render frames in one pass rather than beam-chasing scanlines, keep PSRAM out of the hot path,
-  and pace the 6809 to authentic real time independent of display refresh. This port applies
-  those lessons to a clean implementation for the Fruit Jam's very different hardware.
+  and pace the 6809 to authentic real time independent of display refresh. This port applies those
+  lessons to a clean implementation for the Fruit Jam's very different hardware — the core was
+  re-vendored fresh from upstream 1.11, not copied from any prior port.
 
-## Roadmap
+## Documentation
 
-1. ~~Initialize repo and README~~ (this commit)
-2. File issues for everything the port needs — board bring-up research (HSTX + PIO-USB clocking,
-   audio DAC, SD, PSRAM), core integration, display/input/audio seams, performance targets —
-   then prioritize them.
-3. Start coding, issue by issue.
+- [`docs/hardware-pinout.md`](docs/hardware-pinout.md) — verified pin map (FRUITJAM-01)
+- [`docs/clock-plan.md`](docs/clock-plan.md) — 252 MHz / HSTX / PIO-USB clocking (FRUITJAM-03)
+- [`docs/display-hstx.md`](docs/display-hstx.md) — HSTX DVI scanout
+- [`docs/dual-core.md`](docs/dual-core.md) — core 0 / core 1 split (FRUITJAM-11)
+- [`docs/psram-policy.md`](docs/psram-policy.md) — PSRAM usage policy (FRUITJAM-08)
+- [`docs/perf-log.md`](docs/perf-log.md) — running performance record (FRUITJAM-15)
 
 ## License
 
 GPL-3.0-or-later, matching upstream XRoar. See [LICENSE](LICENSE).
+</content>
+</invoke>
