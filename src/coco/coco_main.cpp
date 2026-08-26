@@ -42,6 +42,15 @@ extern "C" {
 #define COCO_DVI_MODE 1
 #endif
 
+// FRUITJAM-61: crop the VDG border and scale the 256x192 active area 2.5x to
+// fill 640x480, instead of centring it at 2x with a border. OFF by default
+// until it has been measured against the default path — it costs core-0 blit
+// time, and core-0 headroom is the variable that correlates with HSTX desync
+// rate (FRUITJAM-58). See the g_scan declaration for the full rationale.
+#ifndef COCO_CROP_BORDER
+#define COCO_CROP_BORDER 0
+#endif
+
 // FRUITJAM-53: boot-progress NeoPixels, OFF by default until the video
 // interaction is understood. Bisected evidence that they cost HSTX stability:
 //   aaa5593 (pre-NeoPixel)              0 desyncs / 3 min
@@ -113,7 +122,40 @@ static uint16_t g_pal[16] = {
 // budget and desynced the link (black after a few seconds). RGB565 double-
 // buffering would be tear-free but two 150 KB buffers overflow SRAM; the
 // residual blit/scanout tearing is a FRUITJAM-11/23 refinement.
+// FRUITJAM-61: border-cropped 2.5x scaling (COCO_CROP_BORDER=1).
+//
+// The default path centres the CoCo's 256x192 active area in a 320x240
+// framebuffer and lets scanout double it to 640x480, so the picture occupies
+// 512x384 with a 64/48 px border. That border is FAITHFUL — the real VDG draws
+// one — but it costs 44% of the screen area.
+//
+// Cropping it makes the arithmetic exact, not messy: 640/256 and 480/192 are
+// both 2.5, so the active area alone fills 640x480 with the aspect ratio
+// preserved. The catch is that 2.5 is non-integer, so source pixels alternate
+// 2 and 3 output pixels wide. On text that shows as vertical strokes of uneven
+// weight within a glyph. It is tolerable because the sink already resamples
+// 640x480 to the panel non-integrally — this substitutes for that first scaling
+// stage rather than adding one.
+//
+// The implementation exploits an asymmetry: VERTICAL scaling is free and
+// HORIZONTAL is not.
+//   - Vertical is pure row selection. The scanline callback returns a row
+//     POINTER, so g_row[] maps 480 output lines onto 192 source rows at no
+//     per-pixel cost at all.
+//   - Horizontal is fixed by HSTX: expand_shift is ENC_N_SHIFTS=2/ENC_SHIFT=16,
+//     so one 32-bit word always feeds two pixels and an active line is always
+//     320 words. The default path gets its free 2x from native_pixel_mode's
+//     16-bit reads, which BUS-REPLICATE each halfword into both pixels. Turn
+//     native_pixel_mode OFF and those same 320 words carry 640 DISTINCT pixels
+//     — 1:1, still a pure pointer handoff, still zero per-line CPU on core 1.
+// So the buffer is scaled horizontally (640 wide) but stays 1:1 vertically
+// (192 rows), and costs 640*192*2 = 245,760 bytes.
+#if COCO_CROP_BORDER
+static uint16_t        g_scan[COCO_VDG_H][dvi::H_ACTIVE];
+static const uint32_t *g_row[dvi::V_ACTIVE];   // output line -> source row
+#else
 static dvi::Framebuffer g_fb;
+#endif
 static uint8_t          g_rom[16384];
 
 // pico_hdmi 2.0-beta precomposed/native scanout ring (README "Minimal pattern").
@@ -126,9 +168,16 @@ static video_output_precomposed_line_t g_compose_ring[48];
 static const uint32_t CYCLES_PER_FRAME = 14915;
 static const uint32_t FRAME_US         = 16762;   // 60 Hz field period
 
+#if !COCO_CROP_BORDER
 // CoCo 256x192 active area centered in the 320x240 framebuffer.
 static const int OX = (dvi::FB_WIDTH  - COCO_VDG_W) / 2;   // 32
 static const int OY = (dvi::FB_HEIGHT - COCO_VDG_H) / 2;   // 24
+#endif
+
+// Output column span of CoCo pixel x under the 2.5x map: every two source
+// pixels become five output ones, giving the 2,3,2,3 pattern.
+#define SPAN_LO(x) (((x) * 5) / 2)
+#define SPAN_HI(x) ((((x) + 1) * 5) / 2)
 
 // Scanline POINTER callback (native pixel mode): return the address of the
 // framebuffer row and let the DMA read it directly, doubling each pixel in
@@ -137,17 +186,28 @@ static const int OY = (dvi::FB_HEIGHT - COCO_VDG_H) / 2;   // 24
 // HSTX FIFO and desyncing the link. Vertical 2x via active_line >> 1.
 static const uint32_t *RAM_FUNC scanline_ptr_cb(uint32_t v_scanline, uint32_t active_line) {
     (void)v_scanline;
+#if COCO_CROP_BORDER
+    return g_row[active_line];      // 2.5x vertical, precomputed: one load
+#else
     return (const uint32_t *)g_fb.px[active_line >> 1];
+#endif
 }
 
 // Classic (non-native) scanline callback: fill one 640-px active line from the
 // 320-wide row, duplicating each pixel horizontally. Used by COCO_DVI_MODE,
-// which cannot use the pointer/precomposed path — video_output_compose_service()
-// early-returns when dvi_mode is set (video_output_rt.c:864), so the compose
-// ring never builds and the two are not a supported combination.
+// which cannot use the precomposed COMPOSE RING — video_output_compose_service()
+// early-returns when dvi_mode is set, so the ring never builds.
+// CORRECTION: the earlier version of this comment said DVI cannot use the
+// pointer path either, citing video_output_rt.c:864. That file is NOT COMPILED
+// (library.json excludes it). In the built video_output.c,
+// video_output_handle_active_start() checks scanline_pointer_callback FIRST and
+// unconditionally, before it ever looks at dvi_mode — which is why the default
+// DVI build has been using scanline_ptr_cb all along. The compose ring and the
+// pointer path are separate things; only the ring is unavailable in DVI mode.
 // This is a PLAIN COPY, no palette lookup: the palette is applied in blit_frame()
 // on core 0. A per-pixel lookup here overran the line budget historically.
 // Byte-for-byte the callback display_test.cpp runs, which is stable on this sink.
+#if !COCO_CROP_BORDER
 static void RAM_FUNC scanline_cb(uint32_t v_scanline, uint32_t active_line, uint32_t *dst) {
     (void)v_scanline;
     const uint16_t *row = g_fb.px[active_line >> 1];
@@ -156,11 +216,30 @@ static void RAM_FUNC scanline_cb(uint32_t v_scanline, uint32_t active_line, uint
         dst[i] = px | (px << 16);
     }
 }
+#endif
 
 // Compose the CoCo frame (nibble-packed indices) into g_fb as RGB565, centered.
 // The palette lookup lives here (core 0), keeping scanline_cb a plain copy.
 static void blit_frame() {
     const uint8_t *vb = coco_machine_get_vdg_buffer();
+#if COCO_CROP_BORDER
+    for (int y = 0; y < COCO_VDG_H; y++) {
+        const uint8_t *src = &vb[y * (COCO_VDG_W / 2)];
+        uint16_t *dst = g_scan[y];
+        // One packed byte is two CoCo pixels, and 2.5x turns exactly two source
+        // pixels into five output ones — so the nibble pair and the 2,3 output
+        // pattern line up exactly, one byte per iteration. That HALVES the loop
+        // count (128 iterations per row, not 256) while raising stores 2.5x,
+        // which is why this is not simply 2.5x the work of the default blit.
+        for (int i = 0; i < COCO_VDG_W / 2; i++) {
+            uint8_t  b = src[i];
+            uint16_t a = g_pal[b & 0x0F];   // even x -> 2 px wide
+            uint16_t c = g_pal[b >> 4];     // odd  x -> 3 px wide
+            *dst++ = a; *dst++ = a;
+            *dst++ = c; *dst++ = c; *dst++ = c;
+        }
+    }
+#else
     for (int y = 0; y < COCO_VDG_H; y++) {
         const uint8_t *src = &vb[y * (COCO_VDG_W / 2)];
         uint16_t *dst = &g_fb.px[OY + y][OX];
@@ -169,6 +248,7 @@ static void blit_frame() {
             dst[x] = g_pal[idx];
         }
     }
+#endif
 }
 
 // - - - FRUITJAM-44: NeoPixel boot progress - - - - - - - - - - - - - - - - - -
@@ -375,12 +455,28 @@ static void fb_char(int cx, int cy, char c, uint16_t fg, uint16_t bg) {
     else if (c >= ' ' && c <= '?') idx = (uint8_t)c;                // 0x20-0x3F
     else                           idx = 0x20;                      // space
     if (cx < 0 || cy < 0 || cx >= OVL_COLS || cy >= OVL_ROWS) return;
+#if COCO_CROP_BORDER
+    // Rows are 1:1 with the CoCo here (vertical scaling happens at scanout), so
+    // only the columns need the 2.5x map. cx*8 is even, so a cell starts at
+    // exactly cx*20 and glyphs stay cell-aligned.
+    int py = cy * 12;
+    for (int r = 0; r < 12; r++) {
+        uint8_t bits = font_6847[idx * 12 + r];
+        uint16_t *row = g_scan[py + r];
+        for (int b = 0; b < 8; b++) {
+            uint16_t c = (bits & (0x80 >> b)) ? fg : bg;
+            for (int o = SPAN_LO(cx * 8 + b); o < SPAN_HI(cx * 8 + b); o++)
+                row[o] = c;
+        }
+    }
+#else
     int px = OX + cx * 8, py = OY + cy * 12;
     for (int r = 0; r < 12; r++) {
         uint8_t bits = font_6847[idx * 12 + r];
         uint16_t *row = &g_fb.px[py + r][px];
         for (int b = 0; b < 8; b++) row[b] = (bits & (0x80 >> b)) ? fg : bg;
     }
+#endif
 }
 
 static void fb_text(int cx, int cy, const char *s, uint16_t fg, uint16_t bg) {
@@ -991,7 +1087,17 @@ void setup() {
     Serial.flush(); delay(20);
 
     Serial.printf("[%lu ms] ", millis()); Serial.print("STAGE fill fb... "); Serial.flush(); delay(20);
+#if COCO_CROP_BORDER
+    // No border to paint — the active area now covers the whole screen. Build
+    // the output-line -> source-row map once: 480 lines over 192 rows is the
+    // same 2.5x, giving a 3,2,3,2 line-repeat pattern.
+    for (int y = 0; y < COCO_VDG_H; y++)
+        for (int x = 0; x < dvi::H_ACTIVE; x++) g_scan[y][x] = g_pal[8];
+    for (int i = 0; i < dvi::V_ACTIVE; i++)
+        g_row[i] = (const uint32_t *)g_scan[(i * COCO_VDG_H) / dvi::V_ACTIVE];
+#else
     g_fb.fill(g_pal[8]);   // black border
+#endif
     Serial.println("ok"); Serial.flush(); delay(20);
 
     Serial.printf("[%lu ms] ", millis()); Serial.print("STAGE video init... "); Serial.flush(); delay(20);
@@ -1014,7 +1120,15 @@ void setup() {
     // link at ~160 fps (the first FRUITJAM-37 attempt). At 640 the command list
     // and the DMA agree, and the per-line ISR is a pointer handoff again — no
     // 320-word copy stealing SRAM bandwidth from core-0 emulation.
+#if COCO_CROP_BORDER
+    // native_pixel_mode OFF: 32-bit transfers, so each of the 320 words carries
+    // two DISTINCT pixels from the pre-scaled 640-wide row instead of one
+    // bus-replicated pixel twice. Same transfer count, same pointer handoff,
+    // 640 native pixels instead of 320 doubled ones.
+    video_output_set_native_pixel_mode(false);
+#else
     video_output_set_native_pixel_mode(true);
+#endif
     video_output_set_scanline_pointer_callback(scanline_ptr_cb);
     video_output_set_background_task(core1_background); // services the resync request
 #else
@@ -1063,7 +1177,7 @@ void setup() {
 // Core 0: emulate one field, compose, pace to ~60 Hz (resync-not-debt).
 void loop() {
     static uint32_t deadline = 0;
-    static uint32_t frames = 0, last_report = 0, run_us_acc = 0;
+    static uint32_t frames = 0, last_report = 0, run_us_acc = 0, blit_us_acc = 0;
 
     USBHost.task();   // service PIO-USB host: fires the HID callbacks -> keys
 
@@ -1115,7 +1229,14 @@ void loop() {
     if (g_pick_open) {
         if (g_pick_dirty) { draw_picker(); g_pick_dirty = false; }
     } else {
+        // FRUITJAM-61: time the blit separately from the rest of the field. It
+        // is the one cost that changes between the default 2x path and the
+        // cropped 2.5x one, and core-0 headroom is the variable that correlates
+        // with desync rate (FRUITJAM-58) — so this number, not the total, is
+        // what decides whether the cropped path is affordable.
+        uint32_t tb = micros();
         blit_frame();
+        blit_us_acc += micros() - tb;
     }
     audio_feed();     // drain this field's PCM to the TLV320 over I2S
     run_us_acc += micros() - t0;
@@ -1189,6 +1310,12 @@ void loop() {
             last_irq = irq; last_hash = h;
         }
 
+        if (Serial && Serial.availableForWrite() >= 64)
+            Serial.printf("  [blit] %lu us/field (%s, %d bpl)\n",
+                          (unsigned long)(blit_us_acc / (frames - last_report)),
+                          COCO_CROP_BORDER ? "crop 2.5x" : "border 2x",
+                          COCO_CROP_BORDER ? dvi::H_ACTIVE : COCO_VDG_W);
+        blit_us_acc = 0;
         g_audio_peak = 0;
 
         // Desync watchdog, BACKSTOP ONLY. The 150 ms detector above should reach
