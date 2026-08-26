@@ -485,9 +485,50 @@ static void scan_dsk_dir(void) {
     f_closedir(&d);
 }
 
+// FRUITJAM-71: remember the last disk the USER mounted, so a reboot comes back
+// with the same one inserted instead of resetting to AUTO.DSK.
+//
+// Stored on SD as a bare filename, not an index: indices shift the moment a
+// .dsk is added or removed from the card, which would silently mount the wrong
+// image. The file is plain text and hand-editable, and deleting it simply falls
+// back to AUTO.DSK.
+//
+// It lives in /coco/ rather than /coco/dsk/ so scan_dsk_dir() can never see it,
+// and is named .txt so it cannot be mistaken for a disk image.
+#define LAST_DSK_PATH "0:/coco/lastdsk.txt"
+
+static void save_last_dsk(const char *name) {
+    FIL f;
+    if (f_open(&f, LAST_DSK_PATH, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
+        // Not fatal — a read-only or full card just means no persistence.
+        if (Serial && Serial.availableForWrite() >= 48)
+            Serial.println("[picker: could not save last-disk marker]");
+        return;
+    }
+    UINT bw = 0;
+    f_write(&f, name, strlen(name), &bw);
+    f_close(&f);
+}
+
+static bool load_last_dsk(char *out, size_t n) {
+    FIL f;
+    if (f_open(&f, LAST_DSK_PATH, FA_READ) != FR_OK) return false;
+    UINT br = 0;
+    f_read(&f, out, (UINT)(n - 1), &br);
+    f_close(&f);
+    out[br] = '\0';
+    // Tolerate a hand-edited file: strip trailing newline / whitespace.
+    while (br && (out[br - 1] == '\n' || out[br - 1] == '\r' || out[br - 1] == ' '))
+        out[--br] = '\0';
+    return br > 0;
+}
+
 // Load image i into PSRAM and hand it to the FDC, freeing the previous one.
 // Blocks core 0 for the length of the SD read (~160 KB) — see FRUITJAM-50.
-static bool mount_dsk_index(int i) {
+// remember=true persists the choice (FRUITJAM-71); boot passes false, because
+// restoring a disk is not the user choosing it and would rewrite the marker
+// identically on every boot.
+static bool mount_dsk_index(int i, bool remember) {
     if (i < 0 || i >= g_dsk_count) return false;
     char path[48];
     snprintf(path, sizeof(path), "0:/coco/dsk/%s", g_dsk_names[i]);
@@ -498,6 +539,7 @@ static bool mount_dsk_index(int i) {
     g_dsk_img = (uint8_t *)img;
     g_dsk_cur = i;
     coco_machine_mount_dsk(g_dsk_img, len);
+    if (remember) save_last_dsk(g_dsk_names[i]);
     snprintf(g_pick_msg, sizeof(g_pick_msg), "MOUNTED %s", g_dsk_names[i]);
     return true;
 }
@@ -643,7 +685,7 @@ static void picker_task(void) {
         // [CANCEL] closes with no mount and no reboot — the only way out of the
         // picker when no keyboard is attached.
         if (PICK_IS_CANCEL(g_pick_sel)) { g_pick_open = false; return; }
-        mount_dsk_index(g_pick_sel);
+        mount_dsk_index(g_pick_sel, true);
         // FRUITJAM-66/69: button 2 mounts and then FULLY restarts — a cold boot
         // with the selected disk in the drive, not a floppy swapped under a
         // running DOS. Warm reset was not enough: it preserves RAM, so BASIC
@@ -984,7 +1026,7 @@ static void hid_keyboard_apply(const uint8_t *report) {
             }
             if (k_ent) {
                 // ENTER on [CANCEL] closes without mounting, same as ESC.
-                if (!PICK_IS_CANCEL(g_pick_sel)) mount_dsk_index(g_pick_sel);
+                if (!PICK_IS_CANCEL(g_pick_sel)) mount_dsk_index(g_pick_sel, true);
                 g_pick_open = false;
             }
             return;               // modal: swallow everything else
@@ -1194,16 +1236,43 @@ void setup() {
     // Optional disk: mount a JVC .dsk (DIR/LOAD/RUN). AUTO.DSK preferred, else
     // fall back to coco.dsk for a first test. Mutable PSRAM buffer for writes.
     {
-        const uint8_t *dsk_img = nullptr;
-        size_t dsk = load_psram_file("0:/coco/dsk/AUTO.DSK", &dsk_img);
-        if (!dsk) dsk = load_psram_file("0:/coco/roms/coco.dsk", &dsk_img);
-        if (dsk) { g_dsk_img = (uint8_t *)dsk_img;   // FRUITJAM-50: the picker frees this on swap
-                   coco_machine_mount_dsk(g_dsk_img, dsk);
-                   Serial.printf("[disk mounted: %u bytes -> DIR/LOAD] ", (unsigned)dsk); }
-        // FRUITJAM-50: enumerate what else is on the card for the button picker.
+        // FRUITJAM-50: enumerate the card FIRST — resolving a remembered NAME
+        // back to an index needs the list to exist.
         scan_dsk_dir();
-        for (int i = 0; i < g_dsk_count; i++)
-            if (strcasecmp(g_dsk_names[i], "AUTO.DSK") == 0) { g_dsk_cur = g_pick_sel = i; break; }
+
+        // FRUITJAM-71 precedence: the disk the user last mounted, then AUTO.DSK,
+        // then coco.dsk. The user's most recent explicit choice outranks the
+        // static AUTO.DSK marker; delete lastdsk.txt to fall back to it.
+        int  want = -1, from_last = 0;
+        char last[16];
+        if (load_last_dsk(last, sizeof(last))) {
+            from_last = 1;
+            for (int i = 0; i < g_dsk_count; i++)
+                if (strcasecmp(g_dsk_names[i], last) == 0) { want = i; break; }
+            // A remembered disk that has since been removed from the card falls
+            // through to AUTO.DSK rather than failing to boot.
+            if (want < 0 && Serial && Serial.availableForWrite() >= 64)
+                Serial.printf("[last disk '%s' not on card] ", last);
+        }
+        if (want < 0)
+            for (int i = 0; i < g_dsk_count; i++)
+                if (strcasecmp(g_dsk_names[i], "AUTO.DSK") == 0) { want = i; break; }
+
+        if (want >= 0 && mount_dsk_index(want, false)) {
+            // Say WHY this disk was chosen — otherwise a remembered disk and a
+            // plain AUTO.DSK boot are indistinguishable in the log.
+            Serial.printf("[disk mounted: %s (%s) -> DIR/LOAD] ", g_dsk_names[want],
+                          from_last ? "remembered" : "AUTO.DSK");
+        } else {
+            const uint8_t *dsk_img = nullptr;
+            size_t dsk = load_psram_file("0:/coco/roms/coco.dsk", &dsk_img);
+            if (dsk) { g_dsk_img = (uint8_t *)dsk_img;  // FRUITJAM-50: picker frees this on swap
+                       coco_machine_mount_dsk(g_dsk_img, dsk);
+                       Serial.printf("[disk mounted: coco.dsk %u bytes -> DIR/LOAD] ", (unsigned)dsk); }
+        }
+        // Open the picker on whatever is mounted, so the highlight and the drive
+        // agree the first time it is opened.
+        g_pick_sel = (g_dsk_cur >= 0) ? g_dsk_cur : 0;
         if (g_dsk_count) Serial.printf("[picker: %d .dsk] ", g_dsk_count);
     }
     // Optional: drop a DECB .bin at 0:/coco/bin/AUTO.BIN to auto-run it on boot.
