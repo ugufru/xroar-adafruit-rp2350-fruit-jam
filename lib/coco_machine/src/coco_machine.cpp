@@ -815,10 +815,29 @@ extern "C" void coco_machine_cold_reset(void) {
     // which is what "restart with this disk inserted" needs.
     // RAM only: the cartridge ROM and the mounted .dsk live outside g_ram and
     // must survive, or the machine would cold-boot with no disk in the drive.
-    // SAM/PIA/VDG are not touched here for the same reason as the warm path —
-    // BASIC re-initialises them itself as it boots.
     coco_machine_release_all_keys();
     memset(g_ram, 0, sizeof(g_ram));
+
+    // The SAM MUST be reset, and unlike the warm path this is not optional.
+    // If the previous program left the SAM in all-RAM mode (TY set by a write to
+    // $FFDF), the read decode sends $A000-$BFFF to g_ram instead of rom_read()
+    // — and g_ram was just zeroed. The reset VECTOR still comes from ROM, since
+    // $FFE0+ bypasses the TY test, so the CPU jumps to the right address and
+    // then executes zeros. It can never recover either: the instruction that
+    // would clear TY lives in the ROM it can no longer read. Whether a cold boot
+    // worked therefore depended entirely on what the last program did to the
+    // SAM, which is exactly the unpredictability this fixes.
+    // On real hardware the SAM's RESET input clears these, so this is correct
+    // emulation rather than a workaround. sam_f matters too: a stale display
+    // base would have the VDG scanning out from the wrong address.
+    g_m.sam->reset(g_m.sam);
+    g_m.sam_ty = false;
+    g_m.sam_f  = 0;
+
+    // PIAs are deliberately NOT reset. Unlike the SAM they do not gate ROM
+    // visibility, so the ROM can execute and programs them during init — and
+    // mc6821_reset() would clobber the in_source/in_sink levels and delegate
+    // hookups that machine init installs AFTER its own reset call.
     g_m.cpu->reset(g_m.cpu);
 }
 
