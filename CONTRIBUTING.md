@@ -33,6 +33,14 @@ Work is tracked in `issues.jsonl` at the repo root.
   instead of resolving and reads as no progress. When a standing practice
   produces concrete work, file *that* work, scoped so it can close.
 
+### Issue status values
+`open` -> `in-progress` -> `done`. Plus **`closed`**, which means closed
+*without* completing: out of scope, superseded, or decided against. `closed` is
+not a synonym for `done` — keep them distinct, because "we shipped it" and "we
+decided not to" are different facts and the tracker is the only place that
+records which. A `closed` issue must say WHY in its description, and carry a
+revisit trigger if the decision could reasonably be reopened.
+
 ## Doing the work
 - **Don't invent — ask or verify.** Check any claim against the source first
   (grep the repo); when something can't be verified, ask rather than assert.
