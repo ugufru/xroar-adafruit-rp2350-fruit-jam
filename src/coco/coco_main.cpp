@@ -1166,8 +1166,16 @@ void loop() {
         // (>90 fps) the HSTX stream has desynced (FIFO underran) — restart it.
         if (last_ms && fps > 90) {
             g_want_resync = true;   // core 1 performs the resync safely (see core1_background)
-            if (Serial && Serial.availableForWrite() >= 64)
-                Serial.println("  ! HSTX desync detected -> resync requested (core1)");
+            // Log the MEASURED rate, not just the fact. A marginal 95 (a report
+            // window that straddled a glitch) and a latched 160 (the half-line
+            // free-run) are completely different faults, and the old message
+            // could not tell them apart. The resync count makes consecutive
+            // bursts legible in a scripts/serial_logger.py capture.
+            if (Serial && Serial.availableForWrite() >= 96)
+                Serial.printf("  ! HSTX desync: %lu fps (%lu frames in %lu ms) -> resync #%lu requested (core1)\n",
+                              (unsigned long)fps, (unsigned long)(vf - last_vf),
+                              (unsigned long)(now_ms - last_ms),
+                              (unsigned long)(g_resync_count + 1));
         }
         last_vf = vf; last_ms = now_ms;
         last_report = frames; run_us_acc = 0;

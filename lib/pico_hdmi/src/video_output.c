@@ -281,9 +281,39 @@ static void dump_static_command_lists(void)
 
 static void __scratch_x("") hstx_resync(void)
 {
-    // 1. Abort DMA chains
-    dma_channel_abort(DMACH_PING);
-    dma_channel_abort(DMACH_PONG);
+    // 1. Abort DMA chains.
+    //
+    // FRUITJAM-49 (local modification, see PROVENANCE.md). RP2350-E5: an abort
+    // does NOT suppress the aborted channel's CHAIN_TO trigger, so on this part
+    // the EN bit of the aborted channel *and of every channel chained to it*
+    // must be cleared BEFORE the abort. The SDK's dma_channel_abort() does not
+    // implement that workaround -- it only writes dma_hw->abort and spins on
+    // BUSY (see hardware/dma.h, which documents E5 as the caller's job).
+    //
+    // PING and PONG are chained to EACH OTHER, which is the worst case: aborting
+    // PING re-triggers PONG, and aborting PONG re-triggers PING. A live channel
+    // is then left running while steps 5-7 below rewrite its read_addr and
+    // transfer_count and call dma_channel_start() on it -- so the HSTX command
+    // stream resumes at the wrong word. The expander misinterprets every command
+    // after it and the FIFO stops back-pressuring, so the link free-runs at
+    // ~2.67x real rate: 160 fps at 60p. That is precisely the desync signature
+    // this function exists to CLEAR, which means that without the workaround a
+    // resync can cause the very fault it is recovering from -- the mechanism
+    // behind resyncs that latch (96+ in a row, never recovering) instead of
+    // fixing anything.
+    uint32_t ping_ctrl = dma_hw->ch[DMACH_PING].al1_ctrl;
+    uint32_t pong_ctrl = dma_hw->ch[DMACH_PONG].al1_ctrl;
+    // al1_ctrl is the non-triggering CTRL alias, so these writes never start a
+    // channel (the native_pixel_mode swap at step 5 relies on the same thing).
+    dma_hw->ch[DMACH_PING].al1_ctrl = ping_ctrl & ~DMA_CH0_CTRL_TRIG_EN_BITS;
+    dma_hw->ch[DMACH_PONG].al1_ctrl = pong_ctrl & ~DMA_CH0_CTRL_TRIG_EN_BITS;
+    dma_hw->abort = (1u << DMACH_PING) | (1u << DMACH_PONG);
+    while (dma_hw->abort)
+        tight_loop_contents();
+    // Put EN back as we found it. Step 5 re-asserts the correct DATA_SIZE for
+    // native_pixel_mode afterwards, so it wins over the value restored here.
+    dma_hw->ch[DMACH_PING].al1_ctrl = ping_ctrl;
+    dma_hw->ch[DMACH_PONG].al1_ctrl = pong_ctrl;
 
     // 2. Disable HSTX (resets shift register, clock generator, and flushes FIFO)
     hstx_ctrl_hw->csr &= ~HSTX_CTRL_CSR_EN_BITS;

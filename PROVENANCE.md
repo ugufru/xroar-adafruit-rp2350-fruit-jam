@@ -23,8 +23,20 @@ repo, so the lineage stays auditable. See `THIRD_PARTY_LICENSES.md` for licenses
   `clk_hstx = 252/2 = 126 MHz` — the value FRUITJAM-03 measured. Upstream's
   default (`MODE_HSTX_CLK_DIV=1`) assumes a 126 MHz system clock, which we do not
   use (we run 252 MHz for PIO-USB + emulation).
-- **Local modifications:** none to the vendored files. All integration lives in
-  our own `src/display/`.
+- **Local modifications:** one, in `src/video_output.c` and `src/video_output_rt.c`
+  (the same defect exists in both; only `video_output.c` is built). `hstx_resync()`
+  aborted the two mutually-chained HSTX DMA channels with the SDK's
+  `dma_channel_abort()`, which does **not** implement the **RP2350-E5** workaround
+  — `hardware/dma.h` documents that clearing the EN bit of the aborted channel and
+  of every channel chained to it, *before* the abort, is the caller's
+  responsibility. Because PING and PONG chain to each other, each abort
+  re-triggered the other channel, leaving one live while the function rewrote its
+  `read_addr`/`transfer_count` and restarted it. The command stream then resumed
+  mid-word, the HSTX expander misread everything after it, and the link free-ran
+  at ~2.67x (160 fps at 60p) — i.e. the resync could *cause* the desync it exists
+  to clear. Replaced with an explicit EN-clear / simultaneous-abort /
+  EN-restore sequence. Upstream bug, reported against FRUITJAM-49; revisit on the
+  next vendor bump. All other integration lives in our own `src/display/`.
 
 ## lib/xroar_core — XRoar emulation core (CPU / SAM / PIA / VDG / events)
 
