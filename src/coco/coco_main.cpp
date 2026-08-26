@@ -51,6 +51,13 @@ extern "C" {
 #define COCO_CROP_BORDER 0
 #endif
 
+// FRUITJAM-62: smoothing across the 2.5x horizontal map. Only meaningful with
+// COCO_CROP_BORDER. 0 = hard 2,3,2,3 edges; 1 = full linear interpolation;
+// 2 = boundary blend only (default — see the g_mix comment for why).
+#ifndef COCO_CROP_SMOOTH
+#define COCO_CROP_SMOOTH 2
+#endif
+
 // FRUITJAM-53: boot-progress NeoPixels, OFF by default until the video
 // interaction is understood. Bisected evidence that they cost HSTX stability:
 //   aaa5593 (pre-NeoPixel)              0 desyncs / 3 min
@@ -153,6 +160,51 @@ static uint16_t g_pal[16] = {
 #if COCO_CROP_BORDER
 static uint16_t        g_scan[COCO_VDG_H][dvi::H_ACTIVE];
 static const uint32_t *g_row[dvi::V_ACTIVE];   // output line -> source row
+
+#if COCO_CROP_SMOOTH
+// FRUITJAM-62: smoothing the 2.5x map, without paying for a blend per pixel.
+//
+// Nearest-neighbour at 2.5x makes each source pixel 2 or 3 output pixels wide,
+// so a glyph's vertical strokes come out at uneven weight — the "sketchy" text.
+// Linear interpolation fixes it, but blending RGB565 per output pixel means
+// unpack/blend/repack on 122,880 pixels a field, which core 0 cannot afford.
+//
+// It does not have to. The VDG has only 16 colours, so there are just 16x16
+// possible source PAIRS, and the 2.5x pattern uses only four blend ratios.
+// Sampling output pixel j at source position j*0.4 gives, per 5-pixel group:
+//   o0 = s0            o1 = 40% s1     o2 = 80% s1
+//   o3 = 20% s2        o4 = 60% s2
+// so four 16x16 tables — 2 KB total — turn every blend into one lookup. The
+// blit keeps its 5 stores per source byte and swaps 2 palette reads for 5
+// table reads. Note o3/o4 straddle the byte boundary and need the NEXT byte's
+// low nibble, hence the one-pixel lookahead.
+// MODE 2 (default) blends ONLY the boundary pixel, and it is not merely the
+// cheap option — it is arguably the correct one. The complaint is uneven STROKE
+// WEIGHT (a source pixel 2 output px wide next to one 3 px wide), not hard
+// edges as such; full interpolation fixes that but softens edges which were
+// already right, which on a 16-colour VDG reads as blur rather than antialias.
+//
+// Give each source pixel two solid output pixels and let them SHARE the fifth
+// 50/50, and every source pixel occupies 2.5 px exactly:
+//   s0 = o0, o1, half of o2      s1 = half of o2, o3, o4
+// The s1|s2 boundary then falls between groups, so exactly one blend per five
+// pixels — and no lookahead into the next byte at all, unlike mode 1.
+#if COCO_CROP_SMOOTH == 1
+static uint16_t g_mix[4][16][16];
+#else
+static uint16_t g_mix[1][16][16];
+#endif
+
+// w is the weight of b, 0..256.
+static uint16_t mix565(uint16_t a, uint16_t b, uint32_t w) {
+    uint32_t ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
+    uint32_t br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
+    uint32_t r = (ar * (256 - w) + br * w) >> 8;
+    uint32_t g = (ag * (256 - w) + bg * w) >> 8;
+    uint32_t l = (ab * (256 - w) + bb * w) >> 8;
+    return (uint16_t)((r << 11) | (g << 5) | l);
+}
+#endif
 #else
 static dvi::Framebuffer g_fb;
 #endif
@@ -232,11 +284,29 @@ static void blit_frame() {
         // count (128 iterations per row, not 256) while raising stores 2.5x,
         // which is why this is not simply 2.5x the work of the default blit.
         for (int i = 0; i < COCO_VDG_W / 2; i++) {
-            uint8_t  b = src[i];
+            uint8_t b = src[i];
+#if COCO_CROP_SMOOTH == 1
+            uint8_t n0 = b & 0x0F, n1 = b >> 4;
+            // o3/o4 straddle into the next source pixel; the last byte of the
+            // row has none, so hold n1 rather than read past the row.
+            uint8_t n2 = (i + 1 < COCO_VDG_W / 2) ? (src[i + 1] & 0x0F) : n1;
+            *dst++ = g_pal[n0];
+            *dst++ = g_mix[0][n0][n1];
+            *dst++ = g_mix[1][n0][n1];
+            *dst++ = g_mix[2][n1][n2];
+            *dst++ = g_mix[3][n1][n2];
+#elif COCO_CROP_SMOOTH == 2
+            uint8_t  n0 = b & 0x0F, n1 = b >> 4;
+            uint16_t a = g_pal[n0], c = g_pal[n1];
+            *dst++ = a; *dst++ = a;
+            *dst++ = g_mix[0][n0][n1];   // the shared half-pixel
+            *dst++ = c; *dst++ = c;
+#else
             uint16_t a = g_pal[b & 0x0F];   // even x -> 2 px wide
             uint16_t c = g_pal[b >> 4];     // odd  x -> 3 px wide
             *dst++ = a; *dst++ = a;
             *dst++ = c; *dst++ = c; *dst++ = c;
+#endif
         }
     }
 #else
@@ -1095,6 +1165,16 @@ void setup() {
         for (int x = 0; x < dvi::H_ACTIVE; x++) g_scan[y][x] = g_pal[8];
     for (int i = 0; i < dvi::V_ACTIVE; i++)
         g_row[i] = (const uint32_t *)g_scan[(i * COCO_VDG_H) / dvi::V_ACTIVE];
+#if COCO_CROP_SMOOTH
+    // Mode 1: 0.4/0.8/0.2/0.6 as 0..256 weights, in blit read order.
+    // Mode 2: a single 50/50 table for the shared boundary pixel.
+    static const uint16_t W[4] = { 102, 205, 51, 154 };
+    for (int k = 0; k < (int)(sizeof(g_mix) / sizeof(g_mix[0])); k++)
+        for (int a = 0; a < 16; a++)
+            for (int b = 0; b < 16; b++)
+                g_mix[k][a][b] =
+                    mix565(g_pal[a], g_pal[b], COCO_CROP_SMOOTH == 1 ? W[k] : 128);
+#endif
 #else
     g_fb.fill(g_pal[8]);   // black border
 #endif
@@ -1313,7 +1393,10 @@ void loop() {
         if (Serial && Serial.availableForWrite() >= 64)
             Serial.printf("  [blit] %lu us/field (%s, %d bpl)\n",
                           (unsigned long)(blit_us_acc / (frames - last_report)),
-                          COCO_CROP_BORDER ? "crop 2.5x" : "border 2x",
+                          COCO_CROP_BORDER ? (COCO_CROP_SMOOTH == 1 ? "crop 2.5x linear"
+                                            : COCO_CROP_SMOOTH == 2 ? "crop 2.5x edge"
+                                                                    : "crop 2.5x hard")
+                                            : "border 2x",
                           COCO_CROP_BORDER ? dvi::H_ACTIVE : COCO_VDG_W);
         blit_us_acc = 0;
         g_audio_peak = 0;
