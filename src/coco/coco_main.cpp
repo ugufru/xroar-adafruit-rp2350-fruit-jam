@@ -42,6 +42,20 @@ extern "C" {
 #define COCO_DVI_MODE 1
 #endif
 
+// FRUITJAM-53: boot-progress NeoPixels, OFF by default until the video
+// interaction is understood. Bisected evidence that they cost HSTX stability:
+//   aaa5593 (pre-NeoPixel)              0 desyncs / 3 min
+//   1525a48 (fonts, pre-NeoPixel)       0
+//   main with the strip disabled        0
+//   main as committed                   15
+// begin() claims a PIO state machine for GPIO32 and holds it for the whole run;
+// releasing it before core 1 starts helped (15 -> 3) but did not clearly reach
+// zero, and run-to-run variance is too high for short A/B runs to settle it.
+// Set to 1 to get the boot progress bar back.
+#ifndef COCO_NEOPIXEL
+#define COCO_NEOPIXEL 0
+#endif
+
 // FRUITJAM-45/48: how long setup() waits for a serial host before printing the
 // boot banner. 1000 ms: 300 ms proved too tight — a monitor measured 430-520 ms
 // to become ready, so captures lost the banner and the first two STAGE lines.
@@ -165,7 +179,14 @@ static void blit_frame() {
 // FRUITJAM-35 heartbeat LED, which only starts once loop() runs.
 // Safe to bit-bang (the driver disables interrupts): every write happens before
 // core 1 is launched, and nothing in the run loop touches the strip.
-static Adafruit_NeoPixel g_pixels(NUM_NEOPIXEL, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+// FRUITJAM-53: heap-allocated and DESTROYED before core 1 launches. begin()
+// claims a PIO state machine for GPIO32 and holds it for the life of the object;
+// leaving it claimed cost ~15 HSTX desyncs per 3 minutes (bisected: 0 on
+// aaa5593/1525a48, 15 on a031ea2, 0 again with the strip disabled). The
+// destructor calls rp2040releasePIO(), handing the SM back. The WS2812s latch
+// their last colour, so the finished boot pattern stays lit with nothing driving
+// it — which is exactly what a boot-progress display wants anyway.
+static Adafruit_NeoPixel *g_pixels = nullptr;
 
 // All five pixels, filling left to right as boot proceeds. The three you named
 // keep their positions and colours — LED 1 red at power-on, LED 3 green at SD
@@ -189,9 +210,13 @@ static const uint8_t BOOT_PIX_MACHINE = 3;   // LED 4 — blue
 static const uint8_t BOOT_PIX_DONE    = 4;   // LED 5 — indigo
 
 static void boot_pixel(uint8_t idx, uint8_t r, uint8_t g, uint8_t b) {
-    if (idx >= NUM_NEOPIXEL) return;
-    g_pixels.setPixelColor(idx, g_pixels.Color(r, g, b));
-    g_pixels.show();
+#if !COCO_NEOPIXEL
+    (void)idx; (void)r; (void)g; (void)b; return;
+#else
+    if (!g_pixels || idx >= NUM_NEOPIXEL) return;
+    g_pixels->setPixelColor(idx, g_pixels->Color(r, g, b));
+    g_pixels->show();
+#endif
 }
 
 // Has BASIC finished its cold start and reached the "OK" prompt?
@@ -238,10 +263,10 @@ static void neo_idle_cycle(void) {
     static uint16_t hue = 0;
     for (uint8_t i = 0; i < NUM_NEOPIXEL; i++) {
         uint16_t h = (uint16_t)(hue + (uint32_t)i * (65536UL / NUM_NEOPIXEL));
-        g_pixels.setPixelColor(i, Adafruit_NeoPixel::gamma32(
+        g_pixels->setPixelColor(i, Adafruit_NeoPixel::gamma32(
             Adafruit_NeoPixel::ColorHSV(h, 255, 255)));
     }
-    g_pixels.show();
+    g_pixels->show();
     hue += NEO_IDLE_HUE_STEP;
 }
 
@@ -560,10 +585,13 @@ void setup() {
     psram_reinit_timing(clock_get_hz(clk_sys));   // retune QMI PSRAM for 252 MHz (FRUITJAM-08)
 
     // FRUITJAM-44 step 0: powered, clocked, PSRAM retuned.
-    g_pixels.begin();
-    g_pixels.setBrightness(40);   // gentle — these are bright at full scale
-    g_pixels.clear();
-    g_pixels.show();
+#if COCO_NEOPIXEL
+    g_pixels = new Adafruit_NeoPixel(NUM_NEOPIXEL, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+    g_pixels->begin();
+    g_pixels->setBrightness(40);   // gentle — these are bright at full scale
+    g_pixels->clear();
+    g_pixels->show();
+#endif
     boot_pixel(BOOT_PIX_CLOCK, 255, 0, 0);    // LED 1 red
 
     // Host 5V on early so the CH334F hub PHY settles before the host starts.
@@ -752,15 +780,22 @@ void setup() {
     // cross-core setup can't deadlock against a core 1 already running the video
     // DMA-IRQ loop (the pizero ordering). We drive core 1 manually rather than
     // via setup1(), which the framework would auto-launch too early.
+    // FRUITJAM-53: hand the PIO state machine back BEFORE core 1 starts driving
+    // HSTX. The LEDs keep their last colour (WS2812 latch); only the SM is freed.
+    boot_pixel(BOOT_PIX_DONE, 40, 0, 200);
+#if COCO_NEOPIXEL
+    delete g_pixels;
+    g_pixels = nullptr;
+    // The destructor leaves the pin as INPUT. Five WS2812 data inputs on a
+    // floating line is an avoidable noise source next to a marginal TMDS link —
+    // drive it to the idle level instead.
+    pinMode(PIN_NEOPIXEL, OUTPUT);
+    digitalWrite(PIN_NEOPIXEL, LOW);
+#endif
+
     multicore_launch_core1(core1_video_entry);
     Serial.printf("[%lu ms] ", millis()); Serial.println("STAGE core1 launched — entering loop."); Serial.flush(); delay(20);
 
-    // Indigo, tuned for WS2812 rather than taken from the web colour. #4B0082
-    // (75,0,130) is only 1:1.7 red:blue and reads MAGENTA on these LEDs — their
-    // red channel is perceptually stronger than the sRGB value implies. 1:5 keeps
-    // the violet cast while landing on the blue side of it, and staying bright on
-    // blue also stops this being the dimmest pixel of the five.
-    boot_pixel(BOOT_PIX_DONE, 40, 0, 200);    // FRUITJAM-44: boot complete — LED 5 indigo
 }
 
 // Core 0: emulate one field, compose, pace to ~60 Hz (resync-not-debt).
