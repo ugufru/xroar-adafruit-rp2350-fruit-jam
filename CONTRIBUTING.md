@@ -6,7 +6,9 @@ are; there is no separate track for automated contributors.
 
 ## Getting oriented
 New here? Read the README and roadmap, skim the open issues, then pick up the
-next thing. If you can't orient from the project's own docs, that's a
+next thing. If the work touches video or the open HSTX desync, read
+`docs/retrospective-2026-08-26.md` first — it records which conclusions in the
+commit history are established and which only look that way. If you can't orient from the project's own docs, that's a
 documentation gap worth surfacing — not a reason to invent context.
 
 ## Source of truth
