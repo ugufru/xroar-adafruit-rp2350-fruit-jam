@@ -31,6 +31,8 @@
 
 extern "C" {
 #include "pico_hdmi/video_output.h"
+#include "pico_hdmi/video_output_precomposed.h"   // stale/resync counters (FRUITJAM-14 probe)
+#include "pico_hdmi/hstx_data_island_queue.h"     // silence counter (FRUITJAM-14 probe)
 }
 
 // FRUITJAM-37: 1 = DVI mode (no data islands, max sink compatibility);
@@ -667,6 +669,16 @@ void loop() {
                           (unsigned long)vf, (unsigned long)fps, g_audio_peak);
             if (g_resync_count && Serial.availableForWrite() >= 40)
                 Serial.printf("  (resyncs so far: %lu)\n", (unsigned long)g_resync_count);
+            // FRUITJAM-14 probe: is the HDMI/precomposed path actually healthy?
+            // stale  = active lines posted before the compose ring was built
+            //          (falls back to vactive_di_null -> malformed active lines)
+            // silence = data islands the queue had to fill with silence
+            // lib_resync = resyncs counted inside pico_hdmi itself
+            if (Serial.availableForWrite() >= 80)
+                Serial.printf("  [di] stale=%lu silence=%lu lib_resync=%lu\n",
+                              (unsigned long)video_output_precomposed_stale_count,
+                              (unsigned long)hstx_di_queue_silence_count,
+                              (unsigned long)video_output_resync_count);
         }
         g_audio_peak = 0;
 
