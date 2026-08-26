@@ -20,6 +20,7 @@
 #include <Wire.h>
 #include <I2S.h>
 #include <Adafruit_TLV320DAC3100.h>
+#include <Adafruit_NeoPixel.h>
 #include "pico/multicore.h"
 #include "hardware/vreg.h"
 #include "hardware/clocks.h"
@@ -40,6 +41,21 @@ extern "C" {
 #ifndef COCO_DVI_MODE
 #define COCO_DVI_MODE 1
 #endif
+
+// FRUITJAM-45/48: how long setup() waits for a serial host before printing the
+// boot banner. 1000 ms: 300 ms proved too tight — a monitor measured 430-520 ms
+// to become ready, so captures lost the banner and the first two STAGE lines.
+// 1000 ms clears that with ~2x margin and still saves 500 ms per boot against the
+// original 1500. Build with -DSERIAL_READY_WAIT_MS=1500 to be certain of a
+// complete log on a slow host, or a small value to boot as fast as possible.
+// The wait is no longer dead time to look at: LED 1 blinks red throughout
+// (FRUITJAM-48), so a board sitting here is visibly waiting rather than hung.
+#ifndef SERIAL_READY_WAIT_MS
+#define SERIAL_READY_WAIT_MS 1000
+#endif
+
+// Blink period for LED 1 during that wait.
+#define SERIAL_WAIT_BLINK_MS 100
 
 extern "C" {
 #include "ff.h"
@@ -139,6 +155,94 @@ static void blit_frame() {
             dst[x] = g_pal[idx];
         }
     }
+}
+
+// - - - FRUITJAM-44: NeoPixel boot progress - - - - - - - - - - - - - - - - - -
+// Cumulative progress bar across all five onboard pixels: each stage lights the
+// next LED and leaves the earlier ones lit, so the strip fills as boot proceeds. Because it is cumulative, a boot
+// that HANGS leaves the last completed step lit, so the strip says where it
+// stopped with no serial attached — the boot-phase counterpart to the
+// FRUITJAM-35 heartbeat LED, which only starts once loop() runs.
+// Safe to bit-bang (the driver disables interrupts): every write happens before
+// core 1 is launched, and nothing in the run loop touches the strip.
+static Adafruit_NeoPixel g_pixels(NUM_NEOPIXEL, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+
+// All five pixels, filling left to right as boot proceeds. The three you named
+// keep their positions and colours — LED 1 red at power-on, LED 3 green at SD
+// mount, LED 5 blue at completion — and LEDs 2 and 4 fill the gaps, so the strip
+// sweeps red -> blue as a progress bar.
+//
+// Stage points chosen from MEASURED boot timing rather than code order, so the
+// five light at roughly even intervals (monitor attached, ms from reset):
+//   LED 1  ~47   power + 252 MHz clock + PSRAM retune
+//   LED 2  ~568  USB host up   (even-split target ~373)
+//   LED 3  ~818  SD mounted    (target ~747)
+//   LED 4  ~1093 machine ready (target ~1120)
+//   LED 5  ~1493 boot complete (target ~1493)
+// CAVEAT: with NO serial host attached the ready-wait in setup() runs its full
+// 1500 ms instead of the ~430 ms measured here, so LED 1 -> LED 2 stretches by
+// about a second. Everything after LED 2 keeps these intervals.
+static const uint8_t BOOT_PIX_CLOCK   = 0;   // LED 1 — red
+static const uint8_t BOOT_PIX_USB     = 1;   // LED 2 — yellow
+static const uint8_t BOOT_PIX_SD      = 2;   // LED 3 — green
+static const uint8_t BOOT_PIX_MACHINE = 3;   // LED 4 — blue
+static const uint8_t BOOT_PIX_DONE    = 4;   // LED 5 — indigo
+
+static void boot_pixel(uint8_t idx, uint8_t r, uint8_t g, uint8_t b) {
+    if (idx >= NUM_NEOPIXEL) return;
+    g_pixels.setPixelColor(idx, g_pixels.Color(r, g, b));
+    g_pixels.show();
+}
+
+// Has BASIC finished its cold start and reached the "OK" prompt?
+// Detected from the 32x16 text screen at $0400 rather than from a ROM address:
+// measured PC sits in the command-input loop at $A7D3/$A7D5, but those belong to
+// Disk Extended Color BASIC 1.1 specifically, and this port boots Color,
+// Extended+Color or Disk depending on what is on the card. Screen text is the
+// same in all three. Measured timeline (probe, FRUITJAM-46): f=0 screen is
+// uninitialised 0x00; f=30-60 blank while BASIC clears RAM (PC=$A089); f=90
+// banner + OK present. So this fires around f=60-90, roughly a second earlier
+// than the fixed 150-field AUTO.BIN timer assumes.
+// VDG screen codes: glyph = ch & 0x3F, and 0x00-0x1F map to '@'..'_', so
+// 'O' = 0x0F and 'K' = 0x0B.
+static bool basic_at_prompt(void) {
+    const uint8_t *scr = coco_machine_peek_ram(0x0400);
+    if (!scr) return false;
+    for (int row = 0; row < 16; row++) {
+        const uint8_t *r = &scr[row * 32];
+        if ((r[0] & 0x3F) == 0x0F && (r[1] & 0x3F) == 0x0B) return true;   // "OK"
+    }
+    return false;
+}
+
+// Slow hue rotation across all five pixels once BASIC is up. Each pixel is offset
+// by a fifth of the wheel so the strip reads as a drifting rainbow rather than
+// five LEDs blinking in unison.
+// Cost is small but not free: show() bit-bangs with interrupts disabled on THIS
+// core for ~150 us (5 px x 24 bits). At the 80 ms interval below that is ~0.2% of
+// core 0, which matters because core 0 is the constrained one (FRUITJAM-38).
+// Core 1's video IRQ is unaffected — interrupt masking is per-core on RP2350.
+// DISABLED (FRUITJAM-47). Measured: enabling this desynced the HSTX link within
+// ~100 fields and kept it there — 9 desync events / 8 resyncs in 14 s, video_frames
+// running at 159-161 fps instead of 60. Isolation run with the cycle off and
+// everything else identical: 0 desyncs, steady 59-60 fps. The cause is show():
+// Adafruit's RP2 backend drives WS2812 from PIO via pio_sm_put_blocking, spinning
+// core 0 for ~450 us per update while core 1 feeds the HSTX FIFO — the same
+// underrun-to-desync path as FRUITJAM-13/-37. A rarer interval does not fix it;
+// every update risks a glitch. Needs a DMA-fed writer so core 0 never spins.
+#define NEO_IDLE_CYCLE       0
+#define NEO_IDLE_INTERVAL_MS 80
+#define NEO_IDLE_HUE_STEP    256      // of 65536 -> full wheel in ~20 s
+
+static void neo_idle_cycle(void) {
+    static uint16_t hue = 0;
+    for (uint8_t i = 0; i < NUM_NEOPIXEL; i++) {
+        uint16_t h = (uint16_t)(hue + (uint32_t)i * (65536UL / NUM_NEOPIXEL));
+        g_pixels.setPixelColor(i, Adafruit_NeoPixel::gamma32(
+            Adafruit_NeoPixel::ColorHSV(h, 255, 255)));
+    }
+    g_pixels.show();
+    hue += NEO_IDLE_HUE_STEP;
 }
 
 static FATFS g_fs;
@@ -455,6 +559,13 @@ void setup() {
     set_sys_clock_khz(252000, true);
     psram_reinit_timing(clock_get_hz(clk_sys));   // retune QMI PSRAM for 252 MHz (FRUITJAM-08)
 
+    // FRUITJAM-44 step 0: powered, clocked, PSRAM retuned.
+    g_pixels.begin();
+    g_pixels.setBrightness(40);   // gentle — these are bright at full scale
+    g_pixels.clear();
+    g_pixels.show();
+    boot_pixel(BOOT_PIX_CLOCK, 255, 0, 0);    // LED 1 red
+
     // Host 5V on early so the CH334F hub PHY settles before the host starts.
     pinMode(USB_5V_EN, OUTPUT);
     digitalWrite(USB_5V_EN, HIGH);
@@ -465,11 +576,36 @@ void setup() {
     digitalWrite(PIN_LED, HIGH);   // off (active-low)
 
     Serial.begin(115200);
+    // FRUITJAM-45: 300 ms, down from 1500. This wait exists only to give a serial
+    // monitor time to attach before the banner prints; nothing else happens during
+    // it, and with no host attached it ran the full 1500 ms on EVERY boot — the
+    // largest single lump in a ~1500 ms startup. Trade-off: a monitor measured
+    // 430-520 ms to become ready, so captures may now miss the banner and the
+    // earliest STAGE lines.
+    // FRUITJAM-48: blink LED 1 red while we spin here, so this wait reads as
+    // "alive, waiting for a serial host" instead of a board that might be hung.
+    // Safe to drive the strip from this loop: core 1 has not been launched yet,
+    // so there is no HSTX stream for the PIO write to starve (contrast
+    // FRUITJAM-47, where the same call at RUNTIME desyncs video).
     const uint32_t start = millis();
-    while (!Serial && (millis() - start) < 1500) delay(10);
+    {
+        bool     lit        = true;   // LED 1 was set solid red just above
+        uint32_t next_blink = millis() + SERIAL_WAIT_BLINK_MS;
+        while (!Serial && (millis() - start) < SERIAL_READY_WAIT_MS) {
+            if ((int32_t)(millis() - next_blink) >= 0) {
+                lit = !lit;
+                boot_pixel(BOOT_PIX_CLOCK, lit ? 255 : 0, 0, 0);
+                next_blink = millis() + SERIAL_WAIT_BLINK_MS;
+            }
+            delay(5);
+        }
+        boot_pixel(BOOT_PIX_CLOCK, 255, 0, 0);   // leave it solid red on exit
+    }
+    const uint32_t serial_wait = millis() - start;
 
     Serial.println();
     Serial.println("=== FRUITJAM-25 Boot Color BASIC -> DVI ===");
+    Serial.printf("[%lu ms] serial-ready wait took %lu ms\n", millis(), (unsigned long)serial_wait);
     Serial.flush(); delay(50);
 
     // DMA arbitration: pico_hdmi hardcodes DMA channels 0 and 1, but the SD
@@ -486,7 +622,7 @@ void setup() {
     // (a hardware alarm for alarm_pool_create). Init it up front so it gets that
     // resource. DMA 0/1 are reserved above for pico_hdmi, so PIO-USB's
     // dma_claim_unused takes 2/3; SD then takes 4/5; video reclaims 0/1.
-    Serial.print("STAGE usb host... "); Serial.flush(); delay(20);
+    Serial.printf("[%lu ms] ", millis()); Serial.print("STAGE usb host... "); Serial.flush(); delay(20);
     hid_map_init();
     pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
     pio_cfg.pin_dp     = HOST_PIN_DP;
@@ -500,13 +636,15 @@ void setup() {
     USBHost.configure_pio_usb(1, &pio_cfg);
     tuh_hid_set_default_protocol(HID_PROTOCOL_BOOT);
     USBHost.begin(1);
+    boot_pixel(BOOT_PIX_USB, 255, 255, 0);    // FRUITJAM-44: USB host up — LED 2 yellow
     Serial.println("ok"); Serial.flush(); delay(20);
 
-    Serial.print("STAGE mount SD... "); Serial.flush(); delay(20);
+    Serial.printf("[%lu ms] ", millis()); Serial.print("STAGE mount SD... "); Serial.flush(); delay(20);
     if (!mount_sd()) { Serial.println("FATAL: no SD"); while (1) delay(500); }
+    boot_pixel(BOOT_PIX_SD, 0, 255, 0);       // FRUITJAM-44 step 2: SD mounted — LED 3 green
     Serial.println("ok"); Serial.flush(); delay(20);
 
-    Serial.print("STAGE load ROM... "); Serial.flush(); delay(20);
+    Serial.printf("[%lu ms] ", millis()); Serial.print("STAGE load ROM... "); Serial.flush(); delay(20);
     // Prefer 16 KB Extended+Color BASIC (Extended enables PLAY and is required by
     // Disk BASIC): extbas11 -> $8000-$9FFF, bas12 -> $A000-$BFFF. Fall back to
     // Color BASIC alone if Extended isn't present.
@@ -521,7 +659,7 @@ void setup() {
     Serial.printf("ok (%u bytes, %s)\n", (unsigned)got,
                   got == 16384 ? "Extended+Color" : "Color"); Serial.flush(); delay(20);
 
-    Serial.print("STAGE machine init... "); Serial.flush(); delay(20);
+    Serial.printf("[%lu ms] ", millis()); Serial.print("STAGE machine init... "); Serial.flush(); delay(20);
     if (!coco_machine_init(g_rom, got)) { Serial.println("FATAL: machine init"); while (1) delay(500); }
     // Optional cassette: drop a .cas at 0:/coco/tapes/AUTO.CAS, then CLOAD in BASIC.
     {
@@ -552,18 +690,19 @@ void setup() {
     // Match the resampler cadence to our real-time pacing so the I2S ring neither
     // starves nor overflows (see coco_machine_audio_init).
     coco_machine_audio_init(CYCLES_PER_FRAME, FRAME_US);
+    boot_pixel(BOOT_PIX_MACHINE, 0, 0, 255);   // FRUITJAM-44: machine ready — LED 4 blue
     Serial.println("ok"); Serial.flush(); delay(20);
 
-    Serial.print("STAGE audio (TLV320+I2S)... "); Serial.flush(); delay(20);
+    Serial.printf("[%lu ms] ", millis()); Serial.print("STAGE audio (TLV320+I2S)... "); Serial.flush(); delay(20);
     if (audio_init()) Serial.println("ok");
     else              Serial.println("FAILED (continuing, video only)");
     Serial.flush(); delay(20);
 
-    Serial.print("STAGE fill fb... "); Serial.flush(); delay(20);
+    Serial.printf("[%lu ms] ", millis()); Serial.print("STAGE fill fb... "); Serial.flush(); delay(20);
     g_fb.fill(g_pal[8]);   // black border
     Serial.println("ok"); Serial.flush(); delay(20);
 
-    Serial.print("STAGE video init... "); Serial.flush(); delay(20);
+    Serial.printf("[%lu ms] ", millis()); Serial.print("STAGE video init... "); Serial.flush(); delay(20);
     dma_channel_unclaim(0);   // hand 0/1 back for pico_hdmi to claim (SD now on 2/3)
     dma_channel_unclaim(1);
 #if COCO_DVI_MODE
@@ -612,7 +751,14 @@ void setup() {
     // DMA-IRQ loop (the pizero ordering). We drive core 1 manually rather than
     // via setup1(), which the framework would auto-launch too early.
     multicore_launch_core1(core1_video_entry);
-    Serial.println("STAGE core1 launched — entering loop."); Serial.flush(); delay(20);
+    Serial.printf("[%lu ms] ", millis()); Serial.println("STAGE core1 launched — entering loop."); Serial.flush(); delay(20);
+
+    // Indigo, tuned for WS2812 rather than taken from the web colour. #4B0082
+    // (75,0,130) is only 1:1.7 red:blue and reads MAGENTA on these LEDs — their
+    // red channel is perceptually stronger than the sRGB value implies. 1:5 keeps
+    // the violet cast while landing on the blue side of it, and staying bright on
+    // blue also stops this being the dimmest pixel of the five.
+    boot_pixel(BOOT_PIX_DONE, 40, 0, 200);    // FRUITJAM-44: boot complete — LED 5 indigo
 }
 
 // Core 0: emulate one field, compose, pace to ~60 Hz (resync-not-debt).
@@ -631,6 +777,26 @@ void loop() {
         if (exec) { coco_machine_exec(exec); Serial.printf("[AUTO.BIN exec @ $%04X]\n", exec); }
         else        Serial.println("[AUTO.BIN: parse error / no exec block]");
         bin_launched = true;
+    }
+
+    // FRUITJAM-46: once BASIC reaches its prompt, hand the strip over from the
+    // boot progress bar to a slow idle colour cycle.
+    {
+        static bool     basic_up   = false;
+        static uint32_t next_neo   = 0;
+        if (!basic_up) {
+            if (basic_at_prompt()) {
+                basic_up = true;
+                if (Serial && Serial.availableForWrite() >= 48)
+                    Serial.printf("[BASIC at prompt after %lu fields]\n",
+                                  (unsigned long)frames);
+            }
+#if NEO_IDLE_CYCLE
+        } else if (millis() >= next_neo) {
+            neo_idle_cycle();
+            next_neo = millis() + NEO_IDLE_INTERVAL_MS;
+#endif
+        }
     }
 
     uint32_t t0 = micros();
