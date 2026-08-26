@@ -42,12 +42,10 @@ const struct partdb_entry samx8_part   = { .name = "SAMX8",   .description = "un
 const struct partdb_entry mos6551_part = { .name = "MOS6551", .description = "unvendored (stub)", .funcs = &stub_funcs };
 const struct partdb_entry ay891x_part  = { .name = "AY891X",  .description = "unvendored (stub)", .funcs = &stub_funcs };
 
-/* mc6847.c's non-T1 alpha-mode path indexes font_6847[] even though we always
- * instantiate the T1 variant (font-6847t1.c IS vendored). We exclude the real
- * font-6847.c from the build and provide this zeroed placeholder so the linker
- * is satisfied; reaching it at runtime would indicate a config bug, not data. */
-#include <stdint.h>
-const uint8_t font_6847[768] = { 0 };
+/* font_6847[] was a zeroed placeholder here while font-6847.c was excluded from
+ * the build. FRUITJAM-42 renders text from the REAL original-6847 table, so the
+ * genuine font-6847.c is now vendored in and defines the symbol; a stub here
+ * would be a duplicate definition. */
 
 /* - - - fs_* stubs - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
  * serialise.c references these for save-state I/O; that .c is excluded from

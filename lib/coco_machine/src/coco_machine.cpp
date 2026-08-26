@@ -753,8 +753,12 @@ extern "C" _Bool coco_machine_init(const uint8_t *rom, size_t rom_len) {
     // Cassette motor relay on PIA1 CA2 (FRUITJAM-28).
     g_m.pia1->a.control_postwrite = DELEGATE_AS0(void, coco_pia1a_control_postwrite, NULL);
 
-    // CoCo 2 ships the 6847T1 (lowercase via inverse bit). The non-T1 font path
-    // in mc6847.c is then dead at runtime (font_6847[] is a link-time stub).
+    // CoCo 2 ships the 6847T1 (lowercase via inverse bit). mc6847.c's own render
+    // path is dead at runtime here (SUPPRESS_RENDER_SCANLINE); this port rasterises
+    // text itself, so the part variant selects colour/inverse semantics only — the
+    // GLYPHS come from the table chosen by COCO_FONT_T1 (FRUITJAM-42). Leaving the
+    // part as 6847T1 is deliberate: is_t1 also drives bright_orange/inverse_text/
+    // text_border in mc6847.c, which is a separate decision from glyph shapes.
     p = part_create("MC6847", (void *)"6847T1");
     if (!p) return 0;
     g_m.vdg = (struct MC6847 *)p;
@@ -839,7 +843,15 @@ extern "C" void coco_machine_run_cycles(uint32_t cycles) {
 // Palette indices below are the contract with the presentation layer's RGB565
 // table (FRUITJAM-25). Keep the two in lockstep.
 
+// FRUITJAM-42: COCO_FONT_T1=0 (default) uses the ORIGINAL MC6847 character
+// generator — CoCo 1 / early CoCo 2 text. =1 restores the 6847T1 glyph shapes.
+// Note the two tables differ in size AND indexing: font_6847 is 64 glyphs
+// indexed (ch & 0x3F), font_6847t1 is 128 and the uppercase set starts at 0x40.
+#ifndef COCO_FONT_T1
+#define COCO_FONT_T1 0
+#endif
 extern "C" const uint8_t font_6847t1[];   // 128 glyphs x 12 rows
+extern "C" const uint8_t font_6847[];     // 64 glyphs x 12 rows (upstream mc6847.c:509)
 
 #define PAL_GREEN       0
 #define PAL_YELLOW      1
@@ -906,7 +918,11 @@ static void HOT_FUNC(render_alpha_frame)(uint16_t base) {
                     for (int b = 0; b < 8; b++) put2(dst, bp + b, (b < 4) ? left : right);
                 } else {
                     // Alpha: bit 6 = inverse. Glyph index (ch & 0x3F) | 0x40.
+#if COCO_FONT_T1
                     uint8_t glyph = font_6847t1[(((ch & 0x3F) | 0x40)) * 12 + sub];
+#else
+                    uint8_t glyph = font_6847[(ch & 0x3F) * 12 + sub];
+#endif
                     *(uint32_t *)(dst + col * 4) = g_alpha_lut[(ch >> 6) & 1][glyph];
                 }
             }
