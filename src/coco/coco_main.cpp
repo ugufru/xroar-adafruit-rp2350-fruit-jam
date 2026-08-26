@@ -518,6 +518,23 @@ extern "C" const uint8_t font_6847[];
 #define OVL_COLS (COCO_VDG_W / 8)    // 32
 #define OVL_ROWS (COCO_VDG_H / 12)   // 16
 
+// FRUITJAM-70: the picker list is the disks PLUS a trailing [CANCEL] row.
+//
+// Buttons are the no-keyboard path, so every action has to be reachable from
+// the three buttons alone — and cancel was not. ESC and F12 both need a
+// keyboard, and button 2 always commits, which since FRUITJAM-69 also means a
+// COLD BOOT. Opening the picker by accident with no keyboard attached left no
+// way out but to mount something and reboot.
+//
+// A long-press or a chord would have worked but neither is discoverable, which
+// matters most on the device that has no keyboard to tell you otherwise. A row
+// in the list needs no new gesture, documents itself, and sits one press from
+// the top of the list because the selection wraps: UP from the first disk lands
+// on it. It also fixes the empty case — with no disks at all the list is just
+// [CANCEL], where before it was an unescapable empty box.
+#define PICK_COUNT        (g_dsk_count + 1)
+#define PICK_IS_CANCEL(i) ((i) >= g_dsk_count)
+
 static void fb_char(int cx, int cy, char c, uint16_t fg, uint16_t bg) {
     if (c >= 'a' && c <= 'z') c -= 32;
     uint8_t idx;
@@ -571,23 +588,26 @@ static void draw_picker(void) {
         for (int x = 0; x < OVL_COLS; x++) fb_char(x, y, ' ', fg, bg);
 
     int top = g_pick_sel - rows_visible / 2;
-    if (top > g_dsk_count - rows_visible) top = g_dsk_count - rows_visible;
+    if (top > PICK_COUNT - rows_visible) top = PICK_COUNT - rows_visible;
     if (top < 0) top = 0;
 
     fb_text(0, 0, "SELECT DISK", fg, bg);
-    fb_text(0, 1, "UP=3 DN=1 MOUNT+RST=2 F12=ESC", fg, bg);
+    fb_text(0, 1, "UP=3 DN=1 MNT+BOOT=2 ESC=CANCEL", fg, bg);
 
     for (int r = 0; r < rows_visible; r++) {
         int i = top + r;
         for (int c = 0; c < COLS; c++) line[c] = ' ';
-        if (i < g_dsk_count) {
+        if (i == g_dsk_count) {
+            snprintf(line, sizeof(line), "%s[CANCEL]", (i == g_pick_sel) ? ">" : " ");
+        } else if (i < g_dsk_count) {
             const char *mark = (i == g_dsk_cur) ? "*" : " ";
             snprintf(line, sizeof(line), "%s%-12s%s", (i == g_pick_sel) ? ">" : " ",
                      g_dsk_names[i], mark);
         }
         fb_text(0, 2 + r, line, (i == g_pick_sel) ? bg : fg, (i == g_pick_sel) ? hi : bg);
     }
-    if (g_dsk_count == 0) fb_text(0, 2, "NO .DSK FILES IN /COCO/DSK", fg, bg);
+    // Below the list, not at row 2 — row 2 is now the [CANCEL] entry.
+    if (g_dsk_count == 0) fb_text(0, 2 + rows_visible, "NO .DSK FILES IN /COCO/DSK", fg, bg);
     if (g_pick_msg[0])    fb_text(0, 2 + rows_visible + 1, g_pick_msg, fg, bg);
 }
 
@@ -613,23 +633,27 @@ static void picker_task(void) {
     if (prev || next) {
         if (!g_pick_open) { g_pick_open = true; g_pick_msg[0] = '\0'; g_pick_dirty = true; return; }
         g_pick_dirty = true;
-        if (g_dsk_count) {
-            g_pick_sel += next ? 1 : -1;
-            if (g_pick_sel < 0)             g_pick_sel = g_dsk_count - 1;
-            if (g_pick_sel >= g_dsk_count)  g_pick_sel = 0;
-        }
+        g_pick_sel += next ? 1 : -1;
+        if (g_pick_sel < 0)            g_pick_sel = PICK_COUNT - 1;
+        if (g_pick_sel >= PICK_COUNT)  g_pick_sel = 0;
         return;
     }
     if (sel) {
         if (!g_pick_open) { g_pick_open = true; g_pick_msg[0] = '\0'; g_pick_dirty = true; return; }
+        // [CANCEL] closes with no mount and no reboot — the only way out of the
+        // picker when no keyboard is attached.
+        if (PICK_IS_CANCEL(g_pick_sel)) { g_pick_open = false; return; }
         mount_dsk_index(g_pick_sel);
-        // FRUITJAM-66: button 2 mounts AND warm-resets, so the machine boots
-        // from the disk just selected rather than having it swapped under a
-        // running DOS. NOTE this DIFFERS from keyboard ENTER, which still does
-        // a live floppy swap without a reset — the FRUITJAM-50 behaviour. The
-        // two inputs are deliberately no longer equivalent; see the issue.
-        coco_machine_release_all_keys();   // nothing should survive the reset
-        coco_machine_reset();
+        // FRUITJAM-66/69: button 2 mounts and then FULLY restarts — a cold boot
+        // with the selected disk in the drive, not a floppy swapped under a
+        // running DOS. Warm reset was not enough: it preserves RAM, so BASIC
+        // warm-starts with the previous program and variables still in place.
+        // Mount BEFORE the reset, so the disk is already in drive 0 when the
+        // ROM boots.
+        // NOTE this DIFFERS from keyboard ENTER, which still does a live floppy
+        // swap with no reset at all — the FRUITJAM-50 behaviour. The two inputs
+        // are deliberately no longer equivalent; see FRUITJAM-67.
+        coco_machine_cold_reset();
         g_pick_open = false;
     }
 }
@@ -909,7 +933,8 @@ static void hid_keyboard_apply(const uint8_t *report) {
             return now && !before;
         };
         const bool k_f12 = newly(0x45), k_up = newly(0x52),
-                   k_dn  = newly(0x51), k_ent = newly(0x28);
+                   k_dn  = newly(0x51), k_ent = newly(0x28),
+                   k_esc = newly(0x29);
         memcpy(pk_prev, codes, 6);
 
         if (k_f12) {
@@ -926,14 +951,40 @@ static void hid_keyboard_apply(const uint8_t *report) {
             }
         }
         if (g_pick_open) {
-            if ((k_up || k_dn) && g_dsk_count) {
+            // FRUITJAM-68: ESC cancels — closes the overlay without mounting,
+            // which also unhalts the 6809, since the halt in loop() is gated
+            // purely on g_pick_open.
+            //
+            // ESC is CANCEL-ONLY, never a toggle like F12, because HID 0x29 maps
+            // to DSCAN_BREAK: the CoCo BREAK key. If ESC opened the overlay too,
+            // BREAK would become unreachable while the picker is closed, which
+            // is most of the time.
+            //
+            // Closing needs more care than F12 does. F12 is unmapped, so letting
+            // it fall through is harmless; ESC is not. While the overlay is open
+            // this block returns early, so g_prev_codes is never updated — and
+            // the open path zeroed it. Simply closing would leave the NEXT report
+            // seeing a still-held ESC as newly pressed and fire BREAK into BASIC.
+            // Copying the live codes into g_prev_codes marks it already-down, so
+            // no press is generated; the eventual release then targets a key that
+            // was never pressed, which the matrix ignores.
+            if (k_esc) {
+                g_pick_open  = false;
+                g_pick_dirty = true;
+                coco_machine_release_all_keys();
+                g_shift_prev = false;
+                memcpy(g_prev_codes, codes, 6);
+                return;
+            }
+            if (k_up || k_dn) {
                 g_pick_sel += k_dn ? 1 : -1;
-                if (g_pick_sel < 0)            g_pick_sel = g_dsk_count - 1;
-                if (g_pick_sel >= g_dsk_count) g_pick_sel = 0;
+                if (g_pick_sel < 0)           g_pick_sel = PICK_COUNT - 1;
+                if (g_pick_sel >= PICK_COUNT) g_pick_sel = 0;
                 g_pick_dirty = true;
             }
             if (k_ent) {
-                mount_dsk_index(g_pick_sel);
+                // ENTER on [CANCEL] closes without mounting, same as ESC.
+                if (!PICK_IS_CANCEL(g_pick_sel)) mount_dsk_index(g_pick_sel);
                 g_pick_open = false;
             }
             return;               // modal: swallow everything else

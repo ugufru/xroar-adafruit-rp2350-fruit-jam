@@ -804,6 +804,24 @@ extern "C" void coco_machine_reset(void) {
     g_m.cpu->reset(g_m.cpu);
 }
 
+// FRUITJAM-69: full restart, as distinct from the warm reset above.
+extern "C" void coco_machine_cold_reset(void) {
+    if (!g_m.cpu) return;
+    // Color BASIC decides between a warm and a cold start by testing a warm-start
+    // flag held in low RAM. coco_machine_reset() leaves RAM intact, so the flag
+    // survives and the ROM warm-starts: no banner, no RAM clear, any BASIC
+    // program still there. Wiping RAM first makes the flag impossible to match,
+    // so the ROM takes the COLD path — exactly what a power cycle looks like,
+    // which is what "restart with this disk inserted" needs.
+    // RAM only: the cartridge ROM and the mounted .dsk live outside g_ram and
+    // must survive, or the machine would cold-boot with no disk in the drive.
+    // SAM/PIA/VDG are not touched here for the same reason as the warm path —
+    // BASIC re-initialises them itself as it boots.
+    coco_machine_release_all_keys();
+    memset(g_ram, 0, sizeof(g_ram));
+    g_m.cpu->reset(g_m.cpu);
+}
+
 // - - - direct .bin loader (FRUITJAM-19) --------------------------------------
 extern "C" uint16_t coco_machine_load_bin(const uint8_t *bin, size_t len) {
     if (!bin) return 0;

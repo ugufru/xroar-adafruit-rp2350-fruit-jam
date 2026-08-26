@@ -39,6 +39,11 @@ _Bool coco_machine_init(const uint8_t *rom, size_t rom_len);
 // behavior. Used by the keyboard reset chord (FRUITJAM-12).
 void coco_machine_reset(void);
 
+// Full restart: wipes RAM so Color BASIC takes its COLD path (banner, RAM
+// clear, BASIC program gone), as a power cycle would. The cartridge ROM and any
+// mounted .dsk survive, so the machine comes back up with the disk inserted.
+void coco_machine_cold_reset(void);
+
 // Run the 6809 for approximately `cycles` CPU cycles (~0.895 MHz authentic).
 // The VDG/SAM event queue and the 60 Hz field-sync IRQ are pumped as a side
 // effect of the CPU's memory cycles. Frame pacing lives above this call
