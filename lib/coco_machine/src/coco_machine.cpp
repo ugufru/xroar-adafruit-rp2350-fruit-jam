@@ -70,6 +70,20 @@ static_assert((COCO_VDG_W & 1) == 0, "COCO_VDG_W must be even for nibble packing
 
 static CocoMachine g_m;
 
+// FRUITJAM-42: VDG variant. Upstream keys the font off the chip variant — one
+// flag, is_t1, selects font_6847t1 vs font_6847 inside mc6847.c (:495-509). This
+// port rasterises text itself, so it needs the same decision on its own side;
+// keep it a SINGLE source of truth driving both the part we instantiate and the
+// table the renderer reads, rather than a second, independently-settable font
+// switch that could disagree with the part.
+//   0 = MC6847   (CoCo 1 / early CoCo 2)   — original character generator
+//   1 = MC6847T1 (later CoCo 2)            — T1 glyph shapes
+#ifndef COCO_VDG_T1
+#define COCO_VDG_T1 0
+#endif
+static const char *const COCO_VDG_VARIANT = COCO_VDG_T1 ? "6847T1" : "6847";
+
+
 // 64 KB main RAM, SRAM-resident (COCO-41: CoCo RAM never lives in PSRAM).
 static uint8_t g_ram[65536];
 
@@ -753,13 +767,16 @@ extern "C" _Bool coco_machine_init(const uint8_t *rom, size_t rom_len) {
     // Cassette motor relay on PIA1 CA2 (FRUITJAM-28).
     g_m.pia1->a.control_postwrite = DELEGATE_AS0(void, coco_pia1a_control_postwrite, NULL);
 
-    // CoCo 2 ships the 6847T1 (lowercase via inverse bit). mc6847.c's own render
-    // path is dead at runtime here (SUPPRESS_RENDER_SCANLINE); this port rasterises
-    // text itself, so the part variant selects colour/inverse semantics only — the
-    // GLYPHS come from the table chosen by COCO_FONT_T1 (FRUITJAM-42). Leaving the
-    // part as 6847T1 is deliberate: is_t1 also drives bright_orange/inverse_text/
-    // text_border in mc6847.c, which is a separate decision from glyph shapes.
-    p = part_create("MC6847", (void *)"6847T1");
+    // Instantiate the variant COCO_VDG_T1 names, so the part and the renderer's
+    // font can never disagree (FRUITJAM-42). Note every is_t1-dependent branch in
+    // mc6847.c — font lookup, nA_S/INV decode, bright_orange — lives inside
+    // render_scanline() (:415), which this port compiles out via
+    // SUPPRESS_RENDER_SCANLINE, so the variant is inert at runtime and this is
+    // purely a matter of the part declaring what the machine actually is.
+    // Our coco_vdg_fetch already builds non-T1-shaped control words
+    // (v | ((v & 0xC0) << 2): 0x200 = A/S, 0x100 = INV), matching mc6847.c's
+    // non-T1 branch — so "6847" is also the honest description of the wiring.
+    p = part_create("MC6847", (void *)COCO_VDG_VARIANT);
     if (!p) return 0;
     g_m.vdg = (struct MC6847 *)p;
     g_m.vdg->fetch_data  = DELEGATE_AS3(void, uint16, int, uint16p, coco_vdg_fetch, g_m.vdg);
@@ -843,15 +860,8 @@ extern "C" void coco_machine_run_cycles(uint32_t cycles) {
 // Palette indices below are the contract with the presentation layer's RGB565
 // table (FRUITJAM-25). Keep the two in lockstep.
 
-// FRUITJAM-42: COCO_FONT_T1=0 (default) uses the ORIGINAL MC6847 character
-// generator — CoCo 1 / early CoCo 2 text. =1 restores the 6847T1 glyph shapes.
-// Note the two tables differ in size AND indexing: font_6847 is 64 glyphs
-// indexed (ch & 0x3F), font_6847t1 is 128 and the uppercase set starts at 0x40.
-#ifndef COCO_FONT_T1
-#define COCO_FONT_T1 0
-#endif
 extern "C" const uint8_t font_6847t1[];   // 128 glyphs x 12 rows
-extern "C" const uint8_t font_6847[];     // 64 glyphs x 12 rows (upstream mc6847.c:509)
+extern "C" const uint8_t font_6847[];     // 64 glyphs x 12 rows
 
 #define PAL_GREEN       0
 #define PAL_YELLOW      1
@@ -918,9 +928,14 @@ static void HOT_FUNC(render_alpha_frame)(uint16_t base) {
                     for (int b = 0; b < 8; b++) put2(dst, bp + b, (b < 4) ? left : right);
                 } else {
                     // Alpha: bit 6 = inverse. Glyph index (ch & 0x3F) | 0x40.
-#if COCO_FONT_T1
-                    uint8_t glyph = font_6847t1[(((ch & 0x3F) | 0x40)) * 12 + sub];
+                    // Font lookup mirrors upstream mc6847.c:495-509. EXT is tied
+                    // low on the CoCo, so upstream's `if (!EXT)` always holds and
+                    // the external-character-generator path never applies here.
+#if COCO_VDG_T1
+                    // T1: !EXT sets bit 6, then index the 128-glyph table (:505).
+                    uint8_t glyph = font_6847t1[((((ch & 0x3F) | 0x40)) & 0x7F) * 12 + sub];
 #else
+                    // Non-T1: 64-glyph table indexed (data & 0x3f) (:509).
                     uint8_t glyph = font_6847[(ch & 0x3F) * 12 + sub];
 #endif
                     *(uint32_t *)(dst + col * 4) = g_alpha_lut[(ch >> 6) & 1][glyph];
