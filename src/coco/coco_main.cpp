@@ -1162,8 +1162,10 @@ void loop() {
         }
         g_audio_peak = 0;
 
-        // Desync watchdog: a healthy 60p link advances ~60 fps. If frames race
-        // (>90 fps) the HSTX stream has desynced (FIFO underran) — restart it.
+        // Desync watchdog, BACKSTOP ONLY. The 150 ms detector above should reach
+        // any desync first; if this one ever fires it means the fast path missed
+        // it, which is worth knowing. Kept because it costs nothing and it is the
+        // only check that runs if the fast detector is ever refactored away.
         if (last_ms && fps > 90) {
             g_want_resync = true;   // core 1 performs the resync safely (see core1_background)
             // Log the MEASURED rate, not just the fact. A marginal 95 (a report
@@ -1179,6 +1181,49 @@ void loop() {
         }
         last_vf = vf; last_ms = now_ms;
         last_report = frames; run_us_acc = 0;
+    }
+
+    // --- fast desync detection (FRUITJAM-59) ---------------------------------
+    // The desync check used to live in the once-per-second serial report, which
+    // made detection latency up to 2 s: a link that desyncs partway through a
+    // report window reads somewhere between 60 and 160 fps in proportion to WHEN
+    // it broke, so a late onset reads under the 90 threshold and is missed until
+    // the NEXT window. Measured in docs/logs: windows of 68, 71, 71, 74, 81 and
+    // 83 fps, each one a real desync second that went unnoticed, each costing an
+    // extra second of black screen on top of the second it takes to catch it.
+    //
+    // Detection does not need to be tied to the report interval. Sampling
+    // video_frame_count every 150 ms catches onset within ~150 ms instead of up
+    // to 2 s, which is the difference between a 2 s blank and a flicker.
+    //
+    // 150 ms was chosen for margin, not speed. A healthy 60p link delivers 9
+    // frames per window, a desynced one 24; the >90 fps threshold sits at 13.5
+    // frames, comfortably clear of the +-1 frame sampling jitter. A shorter 100 ms
+    // window would only give 6 healthy frames and a much thinner margin — and a
+    // FALSE positive is expensive here, because a needless resync is itself a
+    // visible dropout.
+    {
+        static uint32_t dw_ms = 0, dw_vf = 0, dw_hold = 0;
+        uint32_t now = millis();
+        if (dw_ms == 0) {
+            dw_ms = now; dw_vf = video_frame_count;
+        } else if (now - dw_ms >= 150) {
+            uint32_t vf  = video_frame_count;
+            uint32_t fps = (vf - dw_vf) * 1000 / (now - dw_ms);
+            // Hold off briefly after firing: core 1 performs the resync
+            // asynchronously from its background task, so without this the next
+            // window or two would still measure the pre-resync rate and request
+            // a second, redundant resync — each of which is another dropout.
+            if (fps > 90 && (uint32_t)(now - dw_hold) >= 400) {
+                g_want_resync = true;
+                dw_hold = now;
+                if (Serial && Serial.availableForWrite() >= 64)
+                    Serial.printf("  ! desync %lu fps (150ms) -> resync #%lu\n",
+                                  (unsigned long)fps,
+                                  (unsigned long)(g_resync_count + 1));
+            }
+            dw_ms = now; dw_vf = vf;
+        }
     }
 
     // --- per-core liveness heartbeat (FRUITJAM-35) ---------------------------
