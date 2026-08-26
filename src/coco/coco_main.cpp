@@ -603,7 +603,11 @@ static void picker_task(void) {
 
     if (Serial && Serial.availableForWrite() >= 48)
         Serial.printf("[btn] %s%s%s open=%d sel=%d/%d\n",
-                      sel ? "1" : "", prev ? "2" : "", next ? "3" : "",
+                      // Label by PHYSICAL button, not by action. These were
+                      // 1/2/3 when sel/prev/next mapped to buttons 1/2/3; after
+                      // the FRUITJAM-66 remap the old labels reported the wrong
+                      // button — pressing 3 logged "[btn] 2".
+                      sel ? "2" : "", prev ? "3" : "", next ? "1" : "",
                       (int)g_pick_open, g_pick_sel, g_dsk_count);
 
     if (prev || next) {
@@ -1361,9 +1365,13 @@ void loop() {
         // byte count; if the whole line won't fit we drop the report rather than
         // stall the emulator. The fps/desync LOGIC below still runs regardless.
         if (Serial && Serial.availableForWrite() >= 160) {
-            Serial.printf("emu %lu fields, avg run %lu us/field (%lu.%02lux real-time), video_frames=%lu (%lu fps), audio_peak=%d/32767\n",
+            Serial.printf("emu %lu fields, avg run %lu us/field (%s%lu.%02lux real-time), video_frames=%lu (%lu fps), audio_peak=%d/32767\n",
                           (unsigned long)frames,
                           (unsigned long)(run_us_acc / (frames - last_report)),
+                          // A halted emulator reports a meaningless multiple —
+                          // 28x "real-time" when it is in fact not running at
+                          // all. Mark it rather than let the log read as speed.
+                          g_pick_open ? "HALTED, " : "",
                           // run_us_acc can now be ~0 for a whole report period
                           // if the overlay was open throughout (the emulator is
                           // halted), so guard the divide.
