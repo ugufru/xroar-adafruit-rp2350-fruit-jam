@@ -24,6 +24,12 @@ Work is tracked in `issues.jsonl` at the repo root.
 - Record deferred alternatives with a revisit trigger ("try this if X"), and
   record rejected or forbidden paths with their rationale, so settled decisions
   aren't quietly relitigated.
+- **Every issue needs a completion condition.** If you can't say what would make
+  it `done`, it isn't an issue. Standing practices — keep the docs current, keep
+  the perf log updated, watch for regressions — are SOP and live in this file;
+  they never become tickets, because a ticket that can't close accumulates
+  instead of resolving and reads as no progress. When a standing practice
+  produces concrete work, file *that* work, scoped so it can close.
 
 ## Doing the work
 - **Don't invent — ask or verify.** Check any claim against the source first
