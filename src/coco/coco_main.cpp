@@ -183,7 +183,7 @@ static Adafruit_NeoPixel g_pixels(NUM_NEOPIXEL, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ8
 // 1500 ms instead of the ~430 ms measured here, so LED 1 -> LED 2 stretches by
 // about a second. Everything after LED 2 keeps these intervals.
 static const uint8_t BOOT_PIX_CLOCK   = 0;   // LED 1 — red
-static const uint8_t BOOT_PIX_USB     = 1;   // LED 2 — yellow
+static const uint8_t BOOT_PIX_USB     = 1;   // LED 2 — chartreuse
 static const uint8_t BOOT_PIX_SD      = 2;   // LED 3 — green
 static const uint8_t BOOT_PIX_MACHINE = 3;   // LED 4 — blue
 static const uint8_t BOOT_PIX_DONE    = 4;   // LED 5 — indigo
@@ -636,7 +636,9 @@ void setup() {
     USBHost.configure_pio_usb(1, &pio_cfg);
     tuh_hid_set_default_protocol(HID_PROTOCOL_BOOT);
     USBHost.begin(1);
-    boot_pixel(BOOT_PIX_USB, 255, 255, 0);    // FRUITJAM-44: USB host up — LED 2 yellow
+    // Pulled off pure yellow toward green: WS2812 red reads hot, so (255,255,0)
+    // sits warmer than it looks on paper (same effect that made #4B0082 magenta).
+    boot_pixel(BOOT_PIX_USB, 128, 255, 0);    // FRUITJAM-44: USB host up — LED 2 chartreuse
     Serial.println("ok"); Serial.flush(); delay(20);
 
     Serial.printf("[%lu ms] ", millis()); Serial.print("STAGE mount SD... "); Serial.flush(); delay(20);
