@@ -1160,6 +1160,35 @@ void loop() {
                               (unsigned long)hstx_di_queue_silence_count,
                               (unsigned long)video_output_resync_count);
         }
+        // FRUITJAM-60: emulator liveness probe. A frozen SCREEN and a hung
+        // emulator look identical from outside, and the fields/fps counters
+        // cannot tell them apart — they kept advancing normally through a
+        // KALEIDSC freeze while nothing moved on screen. Three cheap signals
+        // separate the cases:
+        //   PC     — sampled once a second. Pinned or oscillating in a narrow
+        //            range means the 6809 is SPINNING, not that we are hung.
+        //   irq/s  — field-sync IRQs taken, ~60 when healthy. 0 means interrupts
+        //            are masked (CWAI/SYNC, or a crash that left F/I set).
+        //   vdg    — hash of the VDG buffer. Unchanged across seconds means the
+        //            program stopped drawing, which is what "frozen" looks like.
+        // Sampled every 4th byte of the 24 KB buffer, once per second: a few
+        // thousand cycles, far below the noise floor of a 16 ms field.
+        {
+            static uint32_t last_irq = 0, last_hash = 0, static_s = 0;
+            const uint8_t *vb = coco_machine_get_vdg_buffer();
+            uint32_t h = 0;
+            for (int i = 0; i < (COCO_VDG_W / 2) * COCO_VDG_H; i += 4)
+                h = h * 31u + vb[i];
+            uint32_t irq = coco_machine_get_irq_count();
+            static_s = (h == last_hash) ? static_s + 1 : 0;
+            if (Serial && Serial.availableForWrite() >= 96)
+                Serial.printf("  [cpu] PC=$%04X irq/s=%lu vdg=%08lx%s\n",
+                              coco_machine_get_pc(),
+                              (unsigned long)(irq - last_irq), (unsigned long)h,
+                              static_s >= 5 ? "  ! SCREEN STATIC" : "");
+            last_irq = irq; last_hash = h;
+        }
+
         g_audio_peak = 0;
 
         // Desync watchdog, BACKSTOP ONLY. The 150 ms detector above should reach
