@@ -270,6 +270,190 @@ static void neo_idle_cycle(void) {
     hue += NEO_IDLE_HUE_STEP;
 }
 
+
+// - - - FRUITJAM-50: button disk picker - - - - - - - - - - - - - - - - - - - -
+// Button 2 = previous, button 3 = next, button 1 = mount + close. Pressing 2 or
+// 3 while closed opens the picker, so there is no separate "open" gesture — the
+// equivalent of the amoled port's swipe-up.
+// Mounting is a DISK SWAP, not a reset: coco_machine_mount_dsk() swaps the image
+// pointer and re-derives JVC geometry, exactly what changing a floppy does. Disk
+// BASIC keeps running; DIR shows the new disk.
+#define PICKER_MAX 128   // 128 x 13 B name table; card had >32
+
+// Defined further down (with the other SD loaders / the PSRAM allocator block);
+// forward-declared here so the picker can sit next to the rest of the board UI.
+static size_t load_psram_file(const char *path, const uint8_t **out);
+void __psram_free(void *);   // C++ linkage, matching the core's psram.h
+
+static char     g_dsk_names[PICKER_MAX][13];
+static int      g_dsk_count = 0;
+static int      g_dsk_cur   = -1;      // index currently mounted, -1 = none
+static int      g_pick_sel  = 0;
+static bool     g_pick_open = false;
+static uint8_t *g_dsk_img   = nullptr; // PSRAM image backing the mounted disk
+static char     g_pick_msg[40] = "";
+static bool     g_pick_dirty = false;   // redraw the overlay only when it changes
+
+// Buttons are active-low with internal pull-ups. Note button 1 is GPIO0, which
+// is also USB-BOOT — sampled only at reset, so it is free to use at runtime, but
+// never tell a user to hold it while power-cycling.
+struct Btn { uint8_t pin; bool last; uint32_t t; };
+static Btn g_btn[3] = { { PIN_BUTTON1, true, 0 },
+                        { PIN_BUTTON2, true, 0 },
+                        { PIN_BUTTON3, true, 0 } };
+
+static bool btn_fell(Btn &b) {
+    bool now = digitalRead(b.pin);
+    uint32_t ms = millis();
+    if (now != b.last && (ms - b.t) > 25) {
+        b.last = now; b.t = ms;
+        if (!now) return true;          // high -> low = press
+    }
+    return false;
+}
+
+static void scan_dsk_dir(void) {
+    DIR d; FILINFO fno;
+    g_dsk_count = 0;
+    if (f_opendir(&d, "0:/coco/dsk") != FR_OK) return;
+    while (g_dsk_count < PICKER_MAX) {
+        if (f_readdir(&d, &fno) != FR_OK || fno.fname[0] == 0) break;
+        if (fno.fattrib & (AM_DIR | AM_HID | AM_SYS)) continue;
+        // Skip dotfiles: macOS writes an AppleDouble "._NAME.DSK" beside every
+        // real file on a FAT card, and those match *.dsk but are metadata, not
+        // disk images. Also covers .DS_Store, .Spotlight-V100 and friends.
+        if (fno.fname[0] == '.') continue;
+        const char *ext = strrchr(fno.fname, '.');
+        if (!ext || strcasecmp(ext, ".dsk") != 0) continue;
+        strncpy(g_dsk_names[g_dsk_count], fno.fname, 12);
+        g_dsk_names[g_dsk_count][12] = '\0';
+        g_dsk_count++;
+    }
+    // Never truncate silently: say so if the card holds more than we can list.
+    if (g_dsk_count == PICKER_MAX)
+        Serial.printf("[picker: hit PICKER_MAX=%d, further .dsk ignored] ", PICKER_MAX);
+    f_closedir(&d);
+}
+
+// Load image i into PSRAM and hand it to the FDC, freeing the previous one.
+// Blocks core 0 for the length of the SD read (~160 KB) — see FRUITJAM-50.
+static bool mount_dsk_index(int i) {
+    if (i < 0 || i >= g_dsk_count) return false;
+    char path[48];
+    snprintf(path, sizeof(path), "0:/coco/dsk/%s", g_dsk_names[i]);
+    const uint8_t *img = nullptr;
+    size_t len = load_psram_file(path, &img);
+    if (!len) { snprintf(g_pick_msg, sizeof(g_pick_msg), "LOAD FAILED"); return false; }
+    if (g_dsk_img) __psram_free(g_dsk_img);
+    g_dsk_img = (uint8_t *)img;
+    g_dsk_cur = i;
+    coco_machine_mount_dsk(g_dsk_img, len);
+    snprintf(g_pick_msg, sizeof(g_pick_msg), "MOUNTED %s", g_dsk_names[i]);
+    return true;
+}
+
+// - - - framebuffer text overlay (VDG font, 8x12 -> 40x20 cells) - - - - - - - -
+// Reuses font_6847, already linked for the emulator's own text rendering
+// (FRUITJAM-42), so the picker needs no font of its own.
+extern "C" const uint8_t font_6847[];
+
+// Cells are relative to the CoCo's 256x192 ACTIVE AREA (origin OX,OY), not to the
+// 320x240 framebuffer. Two reasons, and the second is the important one:
+//   1. it lines the overlay up with the emulated text the user is looking at;
+//   2. blit_frame() repaints exactly this region every field, so the overlay
+//      ERASES ITSELF the moment we stop drawing it. Anything drawn outside the
+//      active area lands in the border, which nothing ever repaints, and would
+//      stay on screen after the picker closes.
+// So the grid is 32x16 cells, not 40x20.
+#define OVL_COLS (COCO_VDG_W / 8)    // 32
+#define OVL_ROWS (COCO_VDG_H / 12)   // 16
+
+static void fb_char(int cx, int cy, char c, uint16_t fg, uint16_t bg) {
+    if (c >= 'a' && c <= 'z') c -= 32;
+    uint8_t idx;
+    if (c >= '@' && c <= '_')      idx = (uint8_t)(c - '@');        // 0x00-0x1F
+    else if (c >= ' ' && c <= '?') idx = (uint8_t)c;                // 0x20-0x3F
+    else                           idx = 0x20;                      // space
+    if (cx < 0 || cy < 0 || cx >= OVL_COLS || cy >= OVL_ROWS) return;
+    int px = OX + cx * 8, py = OY + cy * 12;
+    for (int r = 0; r < 12; r++) {
+        uint8_t bits = font_6847[idx * 12 + r];
+        uint16_t *row = &g_fb.px[py + r][px];
+        for (int b = 0; b < 8; b++) row[b] = (bits & (0x80 >> b)) ? fg : bg;
+    }
+}
+
+static void fb_text(int cx, int cy, const char *s, uint16_t fg, uint16_t bg) {
+    for (int i = 0; s[i]; i++) fb_char(cx + i, cy, s[i], fg, bg);
+}
+
+// Drawn over the emulator frame each field while the picker is open.
+static void draw_picker(void) {
+    const uint16_t fg  = g_pal[0];    // reuse the machine palette
+    const uint16_t hi  = g_pal[8];
+    const uint16_t bg  = g_pal[9];
+    const int      COLS = OVL_COLS;             // 32, the CoCo text width
+    const int      rows_visible = 12;
+
+    char line[OVL_COLS + 1];
+    for (int i = 0; i < COLS; i++) line[i] = ' ';
+    line[COLS] = '\0';
+
+    // Paint the full 32x16 panel, not just the rows with text: any cell left
+    // unpainted would still hold the last blitted emulator frame and show through.
+    for (int y = 0; y < OVL_ROWS; y++)
+        for (int x = 0; x < OVL_COLS; x++) fb_char(x, y, ' ', fg, bg);
+
+    int top = g_pick_sel - rows_visible / 2;
+    if (top > g_dsk_count - rows_visible) top = g_dsk_count - rows_visible;
+    if (top < 0) top = 0;
+
+    fb_text(0, 0, "SELECT DISK", fg, bg);
+    fb_text(0, 1, "UP/DN=2,3 ENTER=1 F12=CANCEL", fg, bg);
+
+    for (int r = 0; r < rows_visible; r++) {
+        int i = top + r;
+        for (int c = 0; c < COLS; c++) line[c] = ' ';
+        if (i < g_dsk_count) {
+            const char *mark = (i == g_dsk_cur) ? "*" : " ";
+            snprintf(line, sizeof(line), "%s%-12s%s", (i == g_pick_sel) ? ">" : " ",
+                     g_dsk_names[i], mark);
+        }
+        fb_text(0, 2 + r, line, (i == g_pick_sel) ? bg : fg, (i == g_pick_sel) ? hi : bg);
+    }
+    if (g_dsk_count == 0) fb_text(0, 2, "NO .DSK FILES IN /COCO/DSK", fg, bg);
+    if (g_pick_msg[0])    fb_text(0, 2 + rows_visible + 1, g_pick_msg, fg, bg);
+}
+
+// Poll the buttons and drive the picker. Called once per field from loop().
+static void picker_task(void) {
+    bool sel  = btn_fell(g_btn[0]);   // button 1
+    bool prev = btn_fell(g_btn[1]);   // button 2
+    bool next = btn_fell(g_btn[2]);   // button 3
+    if (!sel && !prev && !next) return;
+
+    if (Serial && Serial.availableForWrite() >= 48)
+        Serial.printf("[btn] %s%s%s open=%d sel=%d/%d\n",
+                      sel ? "1" : "", prev ? "2" : "", next ? "3" : "",
+                      (int)g_pick_open, g_pick_sel, g_dsk_count);
+
+    if (prev || next) {
+        if (!g_pick_open) { g_pick_open = true; g_pick_msg[0] = '\0'; g_pick_dirty = true; return; }
+        g_pick_dirty = true;
+        if (g_dsk_count) {
+            g_pick_sel += next ? 1 : -1;
+            if (g_pick_sel < 0)             g_pick_sel = g_dsk_count - 1;
+            if (g_pick_sel >= g_dsk_count)  g_pick_sel = 0;
+        }
+        return;
+    }
+    if (sel) {
+        if (!g_pick_open) { g_pick_open = true; g_pick_msg[0] = '\0'; g_pick_dirty = true; return; }
+        mount_dsk_index(g_pick_sel);
+        g_pick_open = false;
+    }
+}
+
 static FATFS g_fs;
 static bool mount_sd() {
     for (int a = 0; a < 5; a++) {
@@ -310,6 +494,10 @@ static size_t load_cart_rom(const char *path) {
 
 // Load a whole file into a fresh PSRAM buffer (tape/binary images: read in bulk,
 // cold path). Returns the buffer via *out and its size, or 0.
+// Chunk size for runtime PSRAM loads — small enough to leave the bus free, large
+// enough that per-call FatFs overhead stays negligible.
+#define PSRAM_READ_CHUNK 4096
+
 static size_t load_psram_file(const char *path, const uint8_t **out) {
     FIL f;
     if (f_open(&f, path, FA_READ) != FR_OK) return 0;
@@ -317,8 +505,22 @@ static size_t load_psram_file(const char *path, const uint8_t **out) {
     if (sz == 0 || sz > (1u << 20)) { f_close(&f); return 0; }
     uint8_t *buf = (uint8_t *)__psram_malloc(sz);
     if (!buf) { f_close(&f); return 0; }
-    UINT br = 0;
-    f_read(&f, buf, sz, &br);
+    // Read in chunks rather than one 160 KB burst (FRUITJAM-50). At BOOT this is
+    // irrelevant — core 1 is not running yet — but the picker loads disks at
+    // RUNTIME, and a single large read starves the video path: the transfer
+    // hammers the QMI, which also serves XIP flash, so any pico_hdmi code not in
+    // RAM stalls behind it. That corrupts TMDS WITHOUT changing the frame count,
+    // so fps stays 60 and the desync watchdog never fires while the sink quietly
+    // drops lock. Diagnosis: after a mount the CPU, screen RAM and framebuffer
+    // were all verified intact (fb_nonblack=768/768) while the monitor was black.
+    // Chunking leaves gaps for XIP and the HSTX DMA to catch up.
+    UINT br = 0, total = 0;
+    while (total < sz) {
+        UINT want = (UINT)((sz - total > PSRAM_READ_CHUNK) ? PSRAM_READ_CHUNK : sz - total);
+        if (f_read(&f, buf + total, want, &br) != FR_OK || br == 0) break;
+        total += br;
+    }
+    br = total;
     f_close(&f);
     if (br != sz) { __psram_free(buf); return 0; }
     *out = buf;
@@ -509,6 +711,55 @@ static void hid_keyboard_apply(const uint8_t *report) {
         }
     }
 
+    // FRUITJAM-51: picker keys, checked before the matrix diff for the same reason
+    // as the reset chord above — so they never leak through into BASIC.
+    //   F12    toggle the picker open / cancel
+    //   UP/DN  move the selection      ENTER  mount and close
+    // These double up on buttons 2/3/1; either input works at any time.
+    // While the picker is open the overlay is MODAL: every key is swallowed, so
+    // typing cannot run away into BASIC behind an overlay the user is reading.
+    {
+        static uint8_t pk_prev[6] = { 0 };
+        auto newly = [&](uint8_t code) {
+            bool now = false, before = false;
+            for (int i = 0; i < 6; i++) {
+                if (codes[i]  == code) now    = true;
+                if (pk_prev[i] == code) before = true;
+            }
+            return now && !before;
+        };
+        const bool k_f12 = newly(0x45), k_up = newly(0x52),
+                   k_dn  = newly(0x51), k_ent = newly(0x28);
+        memcpy(pk_prev, codes, 6);
+
+        if (k_f12) {
+            g_pick_open = !g_pick_open;
+            g_pick_dirty = true;
+            if (g_pick_open) {
+                g_pick_msg[0] = '\0';
+                // Drop anything the emulator currently thinks is held, or a key
+                // down at the moment F12 arrives would stay stuck for the whole
+                // time the picker is up.
+                coco_machine_release_all_keys();
+                g_shift_prev = false;
+                memset(g_prev_codes, 0, sizeof(g_prev_codes));
+            }
+        }
+        if (g_pick_open) {
+            if ((k_up || k_dn) && g_dsk_count) {
+                g_pick_sel += k_dn ? 1 : -1;
+                if (g_pick_sel < 0)            g_pick_sel = g_dsk_count - 1;
+                if (g_pick_sel >= g_dsk_count) g_pick_sel = 0;
+                g_pick_dirty = true;
+            }
+            if (k_ent) {
+                mount_dsk_index(g_pick_sel);
+                g_pick_open = false;
+            }
+            return;               // modal: swallow everything else
+        }
+    }
+
     bool shift = (mods & 0x22) != 0;
     if (shift && !g_shift_prev) coco_machine_press_key(DSCAN_SHIFT);
     if (!shift && g_shift_prev) coco_machine_release_key(DSCAN_SHIFT);
@@ -602,6 +853,11 @@ void setup() {
     // liveness heartbeat driven from loop(). Not using the shared IR receiver.
     pinMode(PIN_LED, OUTPUT);
     digitalWrite(PIN_LED, HIGH);   // off (active-low)
+
+    // FRUITJAM-50: board buttons, active-low with internal pull-ups.
+    pinMode(PIN_BUTTON1, INPUT_PULLUP);
+    pinMode(PIN_BUTTON2, INPUT_PULLUP);
+    pinMode(PIN_BUTTON3, INPUT_PULLUP);
 
     Serial.begin(115200);
     // FRUITJAM-45: 300 ms, down from 1500. This wait exists only to give a serial
@@ -710,8 +966,14 @@ void setup() {
         const uint8_t *dsk_img = nullptr;
         size_t dsk = load_psram_file("0:/coco/dsk/AUTO.DSK", &dsk_img);
         if (!dsk) dsk = load_psram_file("0:/coco/roms/coco.dsk", &dsk_img);
-        if (dsk) { coco_machine_mount_dsk((uint8_t *)dsk_img, dsk);
+        if (dsk) { g_dsk_img = (uint8_t *)dsk_img;   // FRUITJAM-50: the picker frees this on swap
+                   coco_machine_mount_dsk(g_dsk_img, dsk);
                    Serial.printf("[disk mounted: %u bytes -> DIR/LOAD] ", (unsigned)dsk); }
+        // FRUITJAM-50: enumerate what else is on the card for the button picker.
+        scan_dsk_dir();
+        for (int i = 0; i < g_dsk_count; i++)
+            if (strcasecmp(g_dsk_names[i], "AUTO.DSK") == 0) { g_dsk_cur = g_pick_sel = i; break; }
+        if (g_dsk_count) Serial.printf("[picker: %d .dsk] ", g_dsk_count);
     }
     // Optional: drop a DECB .bin at 0:/coco/bin/AUTO.BIN to auto-run it on boot.
     g_bin_len = load_psram_file("0:/coco/bin/AUTO.BIN", &g_bin_img);
@@ -836,10 +1098,25 @@ void loop() {
         }
     }
 
+    picker_task();          // FRUITJAM-50: board buttons -> disk picker
+
     uint32_t t0 = micros();
     coco_machine_run_cycles(CYCLES_PER_FRAME);
     coco_machine_render_frame();
-    blit_frame();
+    // FRUITJAM-50: while the picker is open, do NOT blit the emulator frame.
+    // There is one framebuffer and no double-buffering (see g_fb), so core 1
+    // scans out while core 0 writes. Painting the emulator frame and then
+    // painting the overlay over it every field leaves a window in which scanout
+    // catches the intermediate state — seen as a bar of emulator screen slowly
+    // scanning down the picker. Freezing the buffer removes the race entirely:
+    // the emulator keeps running, only its DISPLAY pauses, and the overlay is
+    // redrawn just when it changes. Closing the picker resumes the blit, which
+    // repaints the whole active area and erases the overlay on the next field.
+    if (g_pick_open) {
+        if (g_pick_dirty) { draw_picker(); g_pick_dirty = false; }
+    } else {
+        blit_frame();
+    }
     audio_feed();     // drain this field's PCM to the TLV320 over I2S
     run_us_acc += micros() - t0;
 
