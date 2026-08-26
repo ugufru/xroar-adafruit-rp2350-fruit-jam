@@ -31,6 +31,15 @@
 
 extern "C" {
 #include "pico_hdmi/video_output.h"
+}
+
+// FRUITJAM-37: 1 = DVI mode (no data islands, max sink compatibility);
+// 0 = HDMI mode (data islands, needed for future HDMI audio).
+#ifndef COCO_DVI_MODE
+#define COCO_DVI_MODE 1
+#endif
+
+extern "C" {
 #include "ff.h"
 #include "f_util.h"
 #include "coco_machine.h"
@@ -97,6 +106,23 @@ static const int OY = (dvi::FB_HEIGHT - COCO_VDG_H) / 2;   // 24
 static const uint32_t *RAM_FUNC scanline_ptr_cb(uint32_t v_scanline, uint32_t active_line) {
     (void)v_scanline;
     return (const uint32_t *)g_fb.px[active_line >> 1];
+}
+
+// Classic (non-native) scanline callback: fill one 640-px active line from the
+// 320-wide row, duplicating each pixel horizontally. Used by COCO_DVI_MODE,
+// which cannot use the pointer/precomposed path — video_output_compose_service()
+// early-returns when dvi_mode is set (video_output_rt.c:864), so the compose
+// ring never builds and the two are not a supported combination.
+// This is a PLAIN COPY, no palette lookup: the palette is applied in blit_frame()
+// on core 0. A per-pixel lookup here overran the line budget historically.
+// Byte-for-byte the callback display_test.cpp runs, which is stable on this sink.
+static void RAM_FUNC scanline_cb(uint32_t v_scanline, uint32_t active_line, uint32_t *dst) {
+    (void)v_scanline;
+    const uint16_t *row = g_fb.px[active_line >> 1];
+    for (uint32_t i = 0; i < dvi::FB_WIDTH; i++) {
+        uint32_t px = row[i];
+        dst[i] = px | (px << 16);
+    }
 }
 
 // Compose the CoCo frame (nibble-packed indices) into g_fb as RGB565, centered.
@@ -538,18 +564,40 @@ void setup() {
     Serial.print("STAGE video init... "); Serial.flush(); delay(20);
     dma_channel_unclaim(0);   // hand 0/1 back for pico_hdmi to claim (SD now on 2/3)
     dma_channel_unclaim(1);
-    // pico_hdmi 2.0-beta native/precomposed path (README minimal pattern): init
-    // at the NATIVE 320x240 source size; HDMI mode (not DVI — compose_service is
-    // a no-op in DVI); compose ring + native pixel mode + a pointer callback that
-    // returns the 320-wide RGB565 row (HSTX doubles to 640 in hardware); and the
+#if COCO_DVI_MODE
+    // DVI mode: no data islands (this monitor will not sync to them — FRUITJAM-37).
+    // MUST use the classic path: compose_service() early-returns on dvi_mode, so
+    // the precomposed ring never builds; forcing them together desyncs the link
+    // (~160 fps, a resync every second). Init at the FULL 640x480 output size and
+    // let the callback do the 320->640 duplication, exactly as display_test does.
+    video_output_init(dvi::H_ACTIVE, dvi::V_ACTIVE);    // 640x480 OUTPUT size
+    video_output_set_dvi_mode(true);
+    // Native pixel mode WITHOUT the compose ring: in DVI mode the active line is
+    // the static vactive_line_dvi list, which never touches the ring (the ring
+    // only carries audio islands), so the pointer path works here — but ONLY if
+    // init used the full 640 output width. vactive_line_dvi[8] is
+    // HSTX_CMD_TMDS | rt_h_active_pixels; init at 320 emits a half-length line
+    // against a 320-halfword DMA the expander doubles to 640, which desyncs the
+    // link at ~160 fps (the first FRUITJAM-37 attempt). At 640 the command list
+    // and the DMA agree, and the per-line ISR is a pointer handoff again — no
+    // 320-word copy stealing SRAM bandwidth from core-0 emulation.
+    video_output_set_native_pixel_mode(true);
+    video_output_set_scanline_pointer_callback(scanline_ptr_cb);
+    video_output_set_background_task(core1_background); // services the resync request
+#else
+    // HDMI mode + pico_hdmi 2.0-beta native/precomposed path: init at the NATIVE
+    // 320x240 source size, compose ring + native pixel mode + a pointer callback
+    // returning the 320-wide row (HSTX doubles to 640 in hardware), with the
     // compose service as core-1 background work so per-line ISR cost stays ~1.5us
-    // and can't be starved by core-0 emulation load.
+    // and can't be starved by core-0 emulation load. Required for HDMI audio
+    // (FRUITJAM-14), but invisible on any sink that rejects data islands.
     video_output_init(dvi::FB_WIDTH, dvi::FB_HEIGHT);   // 320x240 native source
-    video_output_set_dvi_mode(false);                   // HDMI mode (data islands) — required for compose
+    video_output_set_dvi_mode(false);
     video_output_set_compose_ring(g_compose_ring, sizeof(g_compose_ring) / sizeof(g_compose_ring[0]));
     video_output_set_native_pixel_mode(true);
     video_output_set_scanline_pointer_callback(scanline_ptr_cb);
     video_output_set_background_task(core1_background);
+#endif
     Serial.println("ok"); Serial.flush(); delay(20);
 
     Serial.printf("clk_sys=%lu clk_hstx=%lu MHz. Starting video on core 1.\n",
