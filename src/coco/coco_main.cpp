@@ -575,7 +575,7 @@ static void draw_picker(void) {
     if (top < 0) top = 0;
 
     fb_text(0, 0, "SELECT DISK", fg, bg);
-    fb_text(0, 1, "UP/DN=2,3 ENTER=1 F12=CANCEL", fg, bg);
+    fb_text(0, 1, "UP=3 DN=1 MOUNT+RST=2 F12=ESC", fg, bg);
 
     for (int r = 0; r < rows_visible; r++) {
         int i = top + r;
@@ -592,10 +592,13 @@ static void draw_picker(void) {
 }
 
 // Poll the buttons and drive the picker. Called once per field from loop().
+// FRUITJAM-66: buttons are 3=UP, 2=MOUNT+RESET, 1=DOWN. Button 2 sits in the
+// middle of the physical row, which is where a select key belongs, and leaves
+// the two outer buttons as the up/down pair.
 static void picker_task(void) {
-    bool sel  = btn_fell(g_btn[0]);   // button 1
-    bool prev = btn_fell(g_btn[1]);   // button 2
-    bool next = btn_fell(g_btn[2]);   // button 3
+    bool next = btn_fell(g_btn[0]);   // button 1 -> down / next
+    bool sel  = btn_fell(g_btn[1]);   // button 2 -> mount + warm reset
+    bool prev = btn_fell(g_btn[2]);   // button 3 -> up / prev
     if (!sel && !prev && !next) return;
 
     if (Serial && Serial.availableForWrite() >= 48)
@@ -616,6 +619,13 @@ static void picker_task(void) {
     if (sel) {
         if (!g_pick_open) { g_pick_open = true; g_pick_msg[0] = '\0'; g_pick_dirty = true; return; }
         mount_dsk_index(g_pick_sel);
+        // FRUITJAM-66: button 2 mounts AND warm-resets, so the machine boots
+        // from the disk just selected rather than having it swapped under a
+        // running DOS. NOTE this DIFFERS from keyboard ENTER, which still does
+        // a live floppy swap without a reset — the FRUITJAM-50 behaviour. The
+        // two inputs are deliberately no longer equivalent; see the issue.
+        coco_machine_release_all_keys();   // nothing should survive the reset
+        coco_machine_reset();
         g_pick_open = false;
     }
 }
@@ -1295,8 +1305,6 @@ void loop() {
     picker_task();          // FRUITJAM-50: board buttons -> disk picker
 
     uint32_t t0 = micros();
-    coco_machine_run_cycles(CYCLES_PER_FRAME);
-    coco_machine_render_frame();
     // FRUITJAM-50: while the picker is open, do NOT blit the emulator frame.
     // There is one framebuffer and no double-buffering (see g_fb), so core 1
     // scans out while core 0 writes. Painting the emulator frame and then
@@ -1306,9 +1314,20 @@ void loop() {
     // the emulator keeps running, only its DISPLAY pauses, and the overlay is
     // redrawn just when it changes. Closing the picker resumes the blit, which
     // repaints the whole active area and erases the overlay on the next field.
+    // FRUITJAM-66: HALT the 6809 while the overlay is up. Previously the machine
+    // kept running and only its DISPLAY paused. Halting is better on two counts:
+    // swapping a floppy under a STOPPED DOS is safer than under a running one,
+    // and it hands ~13 ms/field of core 0 back exactly while the overlay is on
+    // screen — which is when the user is looking at it and would most notice a
+    // desync (core-0 headroom tracks desync rate, FRUITJAM-58).
+    // Audio needs no special handling: audio_feed() already tops the I2S ring up
+    // with g_audio_last on underrun, and a held constant sample is DC, i.e.
+    // silence — not a sustained tone.
     if (g_pick_open) {
         if (g_pick_dirty) { draw_picker(); g_pick_dirty = false; }
     } else {
+        coco_machine_run_cycles(CYCLES_PER_FRAME);
+        coco_machine_render_frame();
         // FRUITJAM-61: time the blit separately from the rest of the field. It
         // is the one cost that changes between the default 2x path and the
         // cropped 2.5x one, and core-0 headroom is the variable that correlates
@@ -1345,8 +1364,11 @@ void loop() {
             Serial.printf("emu %lu fields, avg run %lu us/field (%lu.%02lux real-time), video_frames=%lu (%lu fps), audio_peak=%d/32767\n",
                           (unsigned long)frames,
                           (unsigned long)(run_us_acc / (frames - last_report)),
-                          (unsigned long)(FRAME_US * (frames - last_report) / run_us_acc),
-                          (unsigned long)((uint64_t)FRAME_US * (frames - last_report) * 100 / run_us_acc % 100),
+                          // run_us_acc can now be ~0 for a whole report period
+                          // if the overlay was open throughout (the emulator is
+                          // halted), so guard the divide.
+                          (unsigned long)(run_us_acc ? FRAME_US * (frames - last_report) / run_us_acc : 0),
+                          (unsigned long)(run_us_acc ? (uint64_t)FRAME_US * (frames - last_report) * 100 / run_us_acc % 100 : 0),
                           (unsigned long)vf, (unsigned long)fps, g_audio_peak);
             if (g_resync_count && Serial.availableForWrite() >= 40)
                 Serial.printf("  (resyncs so far: %lu)\n", (unsigned long)g_resync_count);
