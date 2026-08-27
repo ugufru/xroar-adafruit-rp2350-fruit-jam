@@ -389,7 +389,7 @@ static void boot_pixel(uint8_t idx, uint8_t r, uint8_t g, uint8_t b) {
 // than the fixed 150-field AUTO.BIN timer assumes.
 // VDG screen codes: glyph = ch & 0x3F, and 0x00-0x1F map to '@'..'_', so
 // 'O' = 0x0F and 'K' = 0x0B.
-static bool basic_at_prompt(void) {
+static bool RAM_FUNC basic_at_prompt(void) {
     const uint8_t *scr = coco_machine_peek_ram(0x0400);
     if (!scr) return false;
     for (int row = 0; row < 16; row++) {
@@ -462,7 +462,7 @@ static Btn g_btn[3] = { { PIN_BUTTON1, true, 0 },
                         { PIN_BUTTON2, true, 0 },
                         { PIN_BUTTON3, true, 0 } };
 
-static bool btn_fell(Btn &b) {
+static bool RAM_FUNC btn_fell(Btn &b) {
     bool now = digitalRead(b.pin);
     uint32_t ms = millis();
     if (now != b.last && (ms - b.t) > 25) {
@@ -597,7 +597,7 @@ static char g_type_buf[48];
 static int  g_type_pos  = -1;   // -1 = idle
 static int  g_type_tick = 0;    // <0 = inter-key gap
 
-static bool dscan_for(char c, uint8_t *dscan, bool *shift) {
+static bool RAM_FUNC dscan_for(char c, uint8_t *dscan, bool *shift) {
     *shift = false;
     if (c >= 'A' && c <= 'Z') { *dscan = (uint8_t)(DSCAN_A + (c - 'A')); return true; }
     if (c >= '0' && c <= '9') { *dscan = (uint8_t)(DSCAN_0 + (c - '0')); return true; }
@@ -613,7 +613,7 @@ static bool dscan_for(char c, uint8_t *dscan, bool *shift) {
     }
 }
 
-static void autotype_task(void) {
+static void RAM_FUNC autotype_task(void) {
     if (g_type_pos < 0) return;
     if (g_type_tick < 0) { g_type_tick++; return; }
     char c = g_type_buf[g_type_pos];
@@ -778,7 +778,7 @@ static void draw_picker(void) {
 // FRUITJAM-66: buttons are 3=UP, 2=MOUNT+RESET, 1=DOWN. Button 2 sits in the
 // middle of the physical row, which is where a select key belongs, and leaves
 // the two outer buttons as the up/down pair.
-static void picker_task(void) {
+static void RAM_FUNC picker_task(void) {
     bool next = btn_fell(g_btn[0]);   // button 1 -> down / next
     bool sel  = btn_fell(g_btn[1]);   // button 2 -> mount + warm reset
     bool prev = btn_fell(g_btn[2]);   // button 3 -> up / prev
@@ -1005,7 +1005,7 @@ static bool audio_init() {
 }
 
 // Per-field feed: push this field's PCM, then hold-last-pad back to the half mark.
-static void audio_feed() {
+static void RAM_FUNC audio_feed() {
     int n = coco_machine_render_audio(g_audio_buf, (int)(sizeof(g_audio_buf) / sizeof(g_audio_buf[0])));
     int field_peak = 0;
     for (int i = 0; i < n; i++) {
@@ -1526,7 +1526,18 @@ void setup() {
 }
 
 // Core 0: emulate one field, compose, pace to ~60 Hz (resync-not-debt).
-void loop() {
+// FRUITJAM-76: loop() itself is the largest flash-resident piece of core 0's
+// per-field path, so it goes to RAM along with everything it calls every field.
+// This is not about these functions being slow — it is about making the timing
+// INDEPENDENT OF WHERE THE LINKER PUTS THEM. FRUITJAM-75 measured 110 lines of
+// never-executed code costing +1.5 ms/field and 964 desyncs/hour purely by
+// shifting addresses; until the hot path is layout-immune, every A/B in this
+// repo is confounded by the act of adding code.
+// Still in flash by necessity: USBHost.task() (TinyUSB) and the Serial.printf
+// report block. The report runs once a second, so it evicts cache lines rarely.
+
+
+void RAM_FUNC loop() {
     static uint32_t deadline = 0;
     static uint32_t frames = 0, last_report = 0, run_us_acc = 0, blit_us_acc = 0;
 
