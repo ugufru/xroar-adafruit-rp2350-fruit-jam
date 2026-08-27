@@ -143,6 +143,8 @@ calculus in four ways — all now validated on hardware:
 
 ## Documentation
 
+- [`docs/hstx-lessons.md`](docs/hstx-lessons.md) — HSTX field notes: the latching
+  failure mode, RP2350-E5, code-layout sensitivity, and the theories that were wrong.
 - [`docs/hardware-pinout.md`](docs/hardware-pinout.md) — verified pin map (FRUITJAM-01)
 - [`docs/clock-plan.md`](docs/clock-plan.md) — 252 MHz / HSTX / PIO-USB clocking (FRUITJAM-03)
 - [`docs/display-hstx.md`](docs/display-hstx.md) — HSTX DVI scanout

@@ -136,6 +136,8 @@ void coco_machine_release_all_keys(void);
 uint16_t coco_machine_get_pc(void);
 uint32_t coco_machine_get_total_mem_cycles(void);
 uint32_t coco_machine_get_irq_count(void);      // 60 Hz field-sync IRQs taken
+uint16_t coco_machine_get_sam_f(void);          // SAM display base ($FFC6-$FFD3)
+uint8_t  coco_machine_get_vdg_mode(void);       // PIA1B VDG mode lines, bits 7..3
 const uint8_t *coco_machine_peek_ram(uint16_t addr);
 
 #ifdef __cplusplus

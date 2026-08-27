@@ -1104,4 +1104,14 @@ extern "C" const uint8_t *coco_machine_get_vdg_buffer(void) { return g_m.vdg_buf
 extern "C" uint16_t coco_machine_get_pc(void)               { return g_m.cpu ? g_m.cpu->reg_pc : 0; }
 extern "C" uint32_t coco_machine_get_total_mem_cycles(void){ return g_m.total_mem_cycles; }
 extern "C" uint32_t coco_machine_get_irq_count(void)       { return g_m.field_syncs; }
+
+// FRUITJAM-82: what the VIDEO hardware is currently pointed at, so a static
+// screen with a running CPU can be told apart from us rendering a stale page.
+// sam_f is the SAM display base (writes to $FFC6-$FFD3); pia1b carries the VDG
+// mode lines (bit7 A/G, 6-4 GM2..0, bit3 CSS).
+extern "C" uint16_t coco_machine_get_sam_f(void)  { return g_m.sam_f; }
+extern "C" uint8_t  coco_machine_get_vdg_mode(void) {
+    if (!g_m.pia1) return 0;
+    return (uint8_t)((g_m.pia1->b.out_source & g_m.pia1->b.out_sink) & 0xF8);
+}
 extern "C" const uint8_t *coco_machine_peek_ram(uint16_t addr) { return &g_ram[addr]; }

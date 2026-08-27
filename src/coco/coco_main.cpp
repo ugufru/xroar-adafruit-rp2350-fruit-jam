@@ -1709,9 +1709,10 @@ void RAM_FUNC loop() {
             uint32_t irq = coco_machine_get_irq_count();
             static_s = (h == last_hash) ? static_s + 1 : 0;
             if (Serial && Serial.availableForWrite() >= 96)
-                Serial.printf("  [cpu] PC=$%04X irq/s=%lu vdg=%08lx%s\n",
+                Serial.printf("  [cpu] PC=$%04X irq/s=%lu vdg=%08lx sam=$%04X mode=%02X%s\n",
                               coco_machine_get_pc(),
                               (unsigned long)(irq - last_irq), (unsigned long)h,
+                              coco_machine_get_sam_f(), coco_machine_get_vdg_mode(),
                               static_s >= 5 ? "  ! SCREEN STATIC" : "");
             last_irq = irq; last_hash = h;
         }
