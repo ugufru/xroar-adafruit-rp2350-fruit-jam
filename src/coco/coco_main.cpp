@@ -58,7 +58,17 @@ extern "C" {
 #define COCO_CROP_SMOOTH 2
 #endif
 
-// FRUITJAM-53: boot-progress NeoPixels, OFF by default until the video
+// FRUITJAM-77: boot-progress NeoPixels, ON by default. Was gated off by
+// FRUITJAM-53, whose evidence does not survive re-measurement — see that issue.
+// The strip is driven only during boot and then LEFT LIT: WS2812s latch, so the
+// last colour persists with no state machine held and nothing touching it at
+// runtime. That is deliberate; it is the pre-FRUITJAM-53 behaviour.
+// NOTE the measured cost, so it is a choice and not an accident: desync rate
+// with the strip LIT is ~21/hr against ~6/hr DARK. Five WS2812s draw ~50-100 mA
+// and the rate tracks ILLUMINATION, not whether the firmware drives them — the
+// COCO_NEOPIXEL=0 build measured the same 21/hr while the strip stayed lit
+// through the WS2812 latch. Set this to 0 AND power-cycle to get the strip dark.
+// FRUITJAM-53 (superseded): boot-progress NeoPixels were off by default until the video
 // interaction is understood. Bisected evidence that they cost HSTX stability:
 //   aaa5593 (pre-NeoPixel)              0 desyncs / 3 min
 //   1525a48 (fonts, pre-NeoPixel)       0
@@ -69,7 +79,7 @@ extern "C" {
 // zero, and run-to-run variance is too high for short A/B runs to settle it.
 // Set to 1 to get the boot progress bar back.
 #ifndef COCO_NEOPIXEL
-#define COCO_NEOPIXEL 0
+#define COCO_NEOPIXEL 1
 #endif
 
 // FRUITJAM-45/48: how long setup() waits for a serial host before printing the
@@ -1510,6 +1520,7 @@ void setup() {
     // FRUITJAM-53: hand the PIO state machine back BEFORE core 1 starts driving
     // HSTX. The LEDs keep their last colour (WS2812 latch); only the SM is freed.
     boot_pixel(BOOT_PIX_DONE, 40, 0, 200);
+
 #if COCO_NEOPIXEL
     delete g_pixels;
     g_pixels = nullptr;
