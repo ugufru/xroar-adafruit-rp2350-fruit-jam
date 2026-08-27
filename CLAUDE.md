@@ -29,6 +29,11 @@ degraded across a long session in a way no code change explains, on a board runn
   **episodes per hour** between builds.
 - **The resync counter is the discriminator.** It increments → the RP2350 lost the link. A dropout
   with the counter unchanged → the fault is downstream (cable, connector, sink re-acquiring).
+- **Code LAYOUT changes the desync rate by orders of magnitude (FRUITJAM-75).** Core 0's per-field
+  path runs from flash via the XIP cache. Adding ~110 lines of *never-executed* code took desyncs
+  from 0/hr to 964/hr and cost +1.5 ms/field; moving `blit_frame()` to `.time_critical` RAM took it
+  back to 31/hr. So **adding code is itself a variable** — an A/B of any change is invalid until the
+  hot path is layout-immune, and `avg run` is not a clean measure of core-0 work either.
 - **Boot-latched faults need many boot cycles, not one long run.**
 - **Verify before concluding, and before filing.** Reading the source has repeatedly turned a
   planned experiment into a no-op or answered a question before it was asked.

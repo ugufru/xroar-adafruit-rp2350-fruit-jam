@@ -274,7 +274,14 @@ static void RAM_FUNC scanline_cb(uint32_t v_scanline, uint32_t active_line, uint
 
 // Compose the CoCo frame (nibble-packed indices) into g_fb as RGB565, centered.
 // The palette lookup lives here (core 0), keeping scanline_cb a plain copy.
-static void blit_frame() {
+// FRUITJAM-75: RAM-resident. This is the largest flash-resident chunk of core
+// 0's per-field path (~3.1 ms/field), and executing it from flash via the XIP
+// cache makes it — and the whole HSTX link — sensitive to where the linker
+// happens to put it. Measured: adding 110 lines of NEVER-EXECUTED code elsewhere
+// in this file cost +1.5 ms/field and took desyncs from 0/hr to 943/hr.
+// .time_critical is single-cycle RAM, so the timing stops depending on layout
+// and the fetches stop contending with the HSTX DMA for flash.
+static void RAM_FUNC blit_frame() {
     const uint8_t *vb = coco_machine_get_vdg_buffer();
 #if COCO_CROP_BORDER
     for (int y = 0; y < COCO_VDG_H; y++) {
