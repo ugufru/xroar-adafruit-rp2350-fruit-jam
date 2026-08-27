@@ -315,7 +315,16 @@ static void __scratch_x("") hstx_resync(void)
     dma_hw->ch[DMACH_PING].al1_ctrl = ping_ctrl;
     dma_hw->ch[DMACH_PONG].al1_ctrl = pong_ctrl;
 
-    // 2. Disable HSTX (resets shift register, clock generator, and flushes FIFO)
+    // 2. FRUITJAM-56: park the pins BEFORE killing HSTX. Disabling HSTX resets
+    //    the shift register and clock generator, so with the pins still driven
+    //    the sink sees the TMDS clock stop and restart mid-garbage and has to
+    //    fully re-acquire — 0.5-2 s of black on every resync, rather than a
+    //    flicker. Ported from video_output_rt.c, which does this correctly but
+    //    is excluded from the build by library.json.
+    for (int i = PIN_HSTX_CLK; i <= PIN_HSTX_D2 + 1; ++i)
+        gpio_set_function(i, GPIO_FUNC_SIO);
+
+    // 3. Disable HSTX (resets shift register, clock generator, and flushes FIFO)
     hstx_ctrl_hw->csr &= ~HSTX_CTRL_CSR_EN_BITS;
 
     // Small delay to ensure HSTX fully stops
@@ -348,9 +357,17 @@ static void __scratch_x("") hstx_resync(void)
     ch_pong->read_addr = (uintptr_t)vblank_line_vsync_off; // Line 1 is also blank
     ch_pong->transfer_count = count_of(vblank_line_vsync_off);
 
-    // 7. Re-enable HSTX then start DMA
+    // 7. Re-enable HSTX then start DMA. Pins are still parked, so nothing
+    //    invalid reaches the sink while the first line serializes.
     hstx_ctrl_hw->csr |= HSTX_CTRL_CSR_EN_BITS;
     dma_channel_start(DMACH_PING);
+
+    // 8. Wait for the first valid line, THEN reconnect the pins, so the sink's
+    //    first exposure after the restart is already well-formed TMDS.
+    while (dma_channel_is_busy(DMACH_PING))
+        tight_loop_contents();
+    for (int i = PIN_HSTX_CLK; i <= PIN_HSTX_D2 + 1; ++i)
+        gpio_set_function(i, 0);
 }
 
 // ============================================================================
