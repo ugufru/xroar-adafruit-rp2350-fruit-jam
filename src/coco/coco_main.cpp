@@ -441,6 +441,7 @@ static int      g_dsk_cur   = -1;      // index currently mounted, -1 = none
 static int      g_pick_sel  = 0;
 static bool     g_pick_open = false;
 static uint8_t *g_dsk_img   = nullptr; // PSRAM image backing the mounted disk
+static size_t   g_dsk_len   = 0;       // its length — needed to find the directory
 static char     g_pick_msg[40] = "";
 static bool     g_pick_dirty = false;   // redraw the overlay only when it changes
 
@@ -537,11 +538,122 @@ static bool mount_dsk_index(int i, bool remember) {
     if (!len) { snprintf(g_pick_msg, sizeof(g_pick_msg), "LOAD FAILED"); return false; }
     if (g_dsk_img) __psram_free(g_dsk_img);
     g_dsk_img = (uint8_t *)img;
+    g_dsk_len = len;
     g_dsk_cur = i;
     coco_machine_mount_dsk(g_dsk_img, len);
     if (remember) save_last_dsk(g_dsk_names[i]);
     snprintf(g_pick_msg, sizeof(g_pick_msg), "MOUNTED %s", g_dsk_names[i]);
     return true;
+}
+
+// - - - FRUITJAM-72: auto-run the first program on a button-mounted disk - - - -
+// After button 2 mounts a disk and cold-boots (FRUITJAM-69), read the disk's
+// RSDOS directory, find the first runnable program, and type the right command at
+// the DECB prompt. Buttons only - the no-keyboard path, where the user has no way
+// to type RUN"..." themselves.
+
+// RSDOS directory: track 17, sectors 3-11 (1-based), 32-byte entries, 8 per
+// 256-byte sector. Entry: [0..7] name space-padded, [8..10] ext, [11] file type,
+// [12] ASCII flag. First byte 0xFF ends the directory, 0x00 marks deleted.
+// Types: 0 = BASIC, 1 = BASIC data, 2 = machine language, 3 = text source. Only
+// 0 and 2 are runnable, so a data file sitting first cannot win.
+static bool dsk_first_program(char *out, size_t outn, int *type_out) {
+    if (!g_dsk_img || !g_dsk_len) return false;
+    size_t hdr = g_dsk_len % 256;      // same JVC rule coco_machine_mount_dsk uses
+    for (int sec = 3; sec <= 11; sec++) {
+        size_t off = hdr + (17u * 18u + (size_t)(sec - 1)) * 256u;
+        if (off + 256 > g_dsk_len) return false;
+        const uint8_t *sp = g_dsk_img + off;
+        for (int e = 0; e < 8; e++) {
+            const uint8_t *d = sp + e * 32;
+            if (d[0] == 0xFF) return false;
+            if (d[0] == 0x00) continue;
+            int t = d[11];
+            if (t != 0 && t != 2) continue;
+            size_t n = 0;
+            for (int i = 0; i < 8 && d[i] != ' ' && n < outn - 1; i++) out[n++] = (char)d[i];
+            out[n] = 0;
+            *type_out = t;
+            return n > 0;
+        }
+    }
+    return false;
+}
+
+// Autotype. The ROM polls the key matrix, so a key must be HELD several fields to
+// register and RELEASED for a few more, or debounce misses it or doubles it.
+#define TYPE_HOLD_FIELDS 3
+#define TYPE_GAP_FIELDS  2
+static char g_type_buf[48];
+static int  g_type_pos  = -1;   // -1 = idle
+static int  g_type_tick = 0;    // <0 = inter-key gap
+
+static bool dscan_for(char c, uint8_t *dscan, bool *shift) {
+    *shift = false;
+    if (c >= 'A' && c <= 'Z') { *dscan = (uint8_t)(DSCAN_A + (c - 'A')); return true; }
+    if (c >= '0' && c <= '9') { *dscan = (uint8_t)(DSCAN_0 + (c - '0')); return true; }
+    switch (c) {
+        case '"': *dscan = DSCAN_2; *shift = true; return true;   // CoCo " is SHIFT+2
+        case ':': *dscan = DSCAN_COLON;     return true;
+        case '.': *dscan = DSCAN_FULL_STOP; return true;
+        case '/': *dscan = DSCAN_SLASH;     return true;
+        case '-': *dscan = DSCAN_MINUS;     return true;
+        case ' ': *dscan = DSCAN_SPACE;     return true;
+        case 10 : *dscan = DSCAN_ENTER;     return true;
+        default : return false;
+    }
+}
+
+static void autotype_task(void) {
+    if (g_type_pos < 0) return;
+    if (g_type_tick < 0) { g_type_tick++; return; }
+    char c = g_type_buf[g_type_pos];
+    if (!c) { g_type_pos = -1; return; }
+    uint8_t d = 0; bool sh = false;
+    bool ok = dscan_for(c, &d, &sh);
+    if (g_type_tick == 0 && ok) {
+        if (sh) coco_machine_press_key(DSCAN_SHIFT);
+        coco_machine_press_key(d);
+    }
+    if (++g_type_tick >= TYPE_HOLD_FIELDS) {
+        if (ok) {
+            coco_machine_release_key(d);
+            if (sh) coco_machine_release_key(DSCAN_SHIFT);
+        }
+        g_type_pos++;
+        g_type_tick = -TYPE_GAP_FIELDS;
+    }
+}
+
+// 0 = idle. 1 = cold boot requested, waiting for the screen to CLEAR. 2 = waiting
+// for a SETTLED OK prompt. Clear-then-OK, not just OK: the pre-reset screen may
+// still show an OK, and firing on that would type into the machine we are about
+// to wipe. The cold reset zeroes RAM so the screen really does go blank first.
+// The first OK is not enough either. Measured: the prompt appeared 1.18 s after
+// the button and typing began at once, and leading characters were swallowed -
+// DECB prints its banner and OK before it is polling the key matrix.
+//   STABLE - OK must be continuously present; kills a transient match while the
+//            screen is still filling (the check reads only two cells of one row).
+//   SETTLE - a further wait after that, covering the gap between the prompt
+//            appearing and DECB accepting keys, which no screen test can see.
+// Characters lost at the start means raise SETTLE.
+#define AUTORUN_OK_STABLE_FIELDS 45
+#define AUTORUN_SETTLE_FIELDS    60
+static int g_autorun    = 0;
+static int g_autorun_ok = 0;
+
+static void autorun_start(void) {
+    char name[16]; int type = 0;
+    if (!dsk_first_program(name, sizeof(name), &type)) {
+        if (Serial && Serial.availableForWrite() >= 48)
+            Serial.println("[autorun: no runnable program in directory]");
+        return;
+    }
+    if (type == 0) snprintf(g_type_buf, sizeof(g_type_buf), "RUN\"%s\"\n", name);
+    else           snprintf(g_type_buf, sizeof(g_type_buf), "LOADM\"%s\":EXEC\n", name);
+    g_type_pos = 0; g_type_tick = 0;
+    if (Serial && Serial.availableForWrite() >= 64)
+        Serial.printf("[autorun: %s (type %d)]\n", name, type);
 }
 
 // - - - framebuffer text overlay (VDG font, 8x12 -> 40x20 cells) - - - - - - - -
@@ -696,6 +808,7 @@ static void picker_task(void) {
         // swap with no reset at all — the FRUITJAM-50 behaviour. The two inputs
         // are deliberately no longer equivalent; see FRUITJAM-67.
         coco_machine_cold_reset();
+        g_autorun   = 1;     // FRUITJAM-72: auto-run once DECB reaches its prompt
         g_pick_open = false;
     }
 }
@@ -1267,6 +1380,7 @@ void setup() {
             const uint8_t *dsk_img = nullptr;
             size_t dsk = load_psram_file("0:/coco/roms/coco.dsk", &dsk_img);
             if (dsk) { g_dsk_img = (uint8_t *)dsk_img;  // FRUITJAM-50: picker frees this on swap
+                       g_dsk_len = dsk;
                        coco_machine_mount_dsk(g_dsk_img, dsk);
                        Serial.printf("[disk mounted: coco.dsk %u bytes -> DIR/LOAD] ", (unsigned)dsk); }
         }
@@ -1427,6 +1541,23 @@ void loop() {
     }
 
     picker_task();          // FRUITJAM-50: board buttons -> disk picker
+
+    // FRUITJAM-72: after a button-2 cold boot, wait for a settled OK prompt then
+    // type the disk's first program. Gated on the emulator actually running -
+    // while the picker is open the 6809 is halted (FRUITJAM-66), so keystrokes
+    // would never be consumed and the screen check would read a frozen frame.
+    if (!g_pick_open) {
+        if (g_autorun == 1) {
+            if (!basic_at_prompt()) { g_autorun = 2; g_autorun_ok = 0; }
+        } else if (g_autorun == 2) {
+            g_autorun_ok = basic_at_prompt() ? g_autorun_ok + 1 : 0;
+            if (g_autorun_ok >= AUTORUN_OK_STABLE_FIELDS + AUTORUN_SETTLE_FIELDS) {
+                g_autorun = 0;
+                autorun_start();
+            }
+        }
+        autotype_task();
+    }
 
     uint32_t t0 = micros();
     // FRUITJAM-50: while the picker is open, do NOT blit the emulator frame.
