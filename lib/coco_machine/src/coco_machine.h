@@ -44,6 +44,12 @@ void coco_machine_reset(void);
 // mounted .dsk survive, so the machine comes back up with the disk inserted.
 void coco_machine_cold_reset(void);
 
+// PMODE 4 / RG6 NTSC artifact colour. 0 = off (plain 1bpp), 1 = phase A,
+// 2 = phase B. Phase is power-on-arbitrary on real hardware, so both must be
+// reachable - that is what "press reset until the colours look right" means.
+void coco_machine_set_artifact(int mode);
+int  coco_machine_get_artifact(void);
+
 // Run the 6809 for approximately `cycles` CPU cycles (~0.895 MHz authentic).
 // The VDG/SAM event queue and the 60 Hz field-sync IRQ are pumped as a side
 // effect of the CPU's memory cycles. Frame pacing lives above this call

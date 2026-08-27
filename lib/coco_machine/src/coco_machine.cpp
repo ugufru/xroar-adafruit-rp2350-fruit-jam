@@ -910,6 +910,15 @@ extern "C" const uint8_t font_6847[];     // 64 glyphs x 12 rows
 #define PAL_ORANGE      7
 #define PAL_BLACK       8
 #define PAL_DARK_GREEN  9
+// FRUITJAM-73: NTSC artifact colours. Slots 10-11 were spare in the 16-entry
+// palette, so these cost nothing and disturb no existing mapping.
+#define PAL_ART_BLUE   10
+#define PAL_ART_ORANGE 11
+
+// 0 = off (plain 1bpp), 1 = phase A, 2 = phase B. Phase is power-on-arbitrary on
+// real hardware - hence "press reset until the colours look right" in CoCo game
+// manuals - so BOTH phases must be reachable or half the software looks wrong.
+static int g_artifact = 0;
 
 // Vertical replication (display scanlines per data row) for graphics GM 0..7.
 static const uint8_t GM_nLPR[8] = { 3, 3, 3, 2, 2, 1, 1, 1 };
@@ -1030,17 +1039,51 @@ static void HOT_FUNC(render_graphics_frame)(uint16_t base, uint8_t gm, bool css)
 // RG6 / PMODE 4: 1 bit/pixel, 256x192 mono. NTSC artifact colour is a later
 // refinement (its phase is power-on-arbitrary — a FRUITJAM polish item); render
 // plain white-on-black for now.
-static void HOT_FUNC(render_rg6_frame)(uint16_t base) {
+// FRUITJAM-73: optional NTSC artifact colour. On a real NTSC CoCo the pixel rate
+// (~7.16 MHz) is exactly TWICE the colour subcarrier (3.579545 MHz), so
+// alternating pixel patterns land on the subcarrier and the TV's colour decoder
+// reads them as chroma. One-bit data therefore shows as four colours, keyed on
+// PIXEL PAIRS: 00 black, 01 and 10 the two artifact colours, 11 foreground.
+// Effective horizontal resolution halves to 128 - that is authentic, not a bug,
+// and is why artifact games look chunky.
+//
+// A pair lookup, not an NTSC simulation. It is what the other RP2350 ports do
+// and it is enough for the software that depends on it.
+//
+// CSS also picks the foreground: green on black, or buff/white on black. The
+// previous version ignored css entirely and always drew white, which was wrong
+// for CSS=0 whether or not artifacting is on.
+static void HOT_FUNC(render_rg6_frame)(uint16_t base, bool css) {
+    const uint8_t fg = css ? PAL_WHITE : PAL_GREEN;
+    const uint8_t a1 = (g_artifact == 2) ? PAL_ART_ORANGE : PAL_ART_BLUE;
+    const uint8_t a2 = (g_artifact == 2) ? PAL_ART_BLUE   : PAL_ART_ORANGE;
     for (int row = 0; row < COCO_VDG_H; row++) {
         const uint8_t *src = &g_ram[(uint16_t)(base + row * 32)];
         uint8_t *dst = &g_m.vdg_buffer[row * (COCO_VDG_W / 2)];
-        for (int byte = 0; byte < 32; byte++) {
-            uint8_t b = src[byte];
-            for (int bit = 0; bit < 8; bit++)
-                put2(dst, byte * 8 + bit, (b & (0x80 >> bit)) ? PAL_WHITE : PAL_BLACK);
+        if (!g_artifact) {
+            for (int byte = 0; byte < 32; byte++) {
+                uint8_t b = src[byte];
+                for (int bit = 0; bit < 8; bit++)
+                    put2(dst, byte * 8 + bit, (b & (0x80 >> bit)) ? fg : PAL_BLACK);
+            }
+        } else {
+            for (int byte = 0; byte < 32; byte++) {
+                uint8_t b = src[byte];
+                for (int pr = 0; pr < 4; pr++) {        // four pixel PAIRS per byte
+                    uint8_t two = (uint8_t)((b >> (6 - pr * 2)) & 3);  // MSB-first
+                    uint8_t c = (two == 0) ? PAL_BLACK
+                              : (two == 3) ? fg
+                              : (two == 1) ? a1 : a2;
+                    put2(dst, byte * 8 + pr * 2,     c);
+                    put2(dst, byte * 8 + pr * 2 + 1, c);
+                }
+            }
         }
     }
 }
+
+extern "C" void coco_machine_set_artifact(int mode) { g_artifact = mode % 3; }
+extern "C" int  coco_machine_get_artifact(void)     { return g_artifact; }
 
 extern "C" void HOT_FUNC(coco_machine_render_frame)(void) {
     if (!g_m.pia1) return;
@@ -1049,7 +1092,7 @@ extern "C" void HOT_FUNC(coco_machine_render_frame)(void) {
     const uint8_t  gm   = (pb >> 4) & 7;
     const bool     css  = (pb & 0x08) != 0;
     if (pb & 0x80) {                     // ¬A/G set -> graphics
-        if (gm == 7) render_rg6_frame(base);
+        if (gm == 7) render_rg6_frame(base, css);
         else         render_graphics_frame(base, gm, css);
     } else {                             // alpha + SG4
         render_alpha_frame(base);

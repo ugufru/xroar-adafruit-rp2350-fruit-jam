@@ -120,7 +120,9 @@ static uint16_t g_pal[16] = {
     dvi::rgb565(0xE0, 0x80, 0x10),  // 7 ORANGE
     dvi::rgb565(0x00, 0x00, 0x00),  // 8 BLACK
     dvi::rgb565(0x00, 0x38, 0x00),  // 9 DARK GREEN
-    0, 0, 0, 0, 0, 0
+    dvi::rgb565(0x30, 0x50, 0xE0),  // 10 ARTIFACT BLUE   (FRUITJAM-73)
+    dvi::rgb565(0xE0, 0x60, 0x18),  // 11 ARTIFACT ORANGE (FRUITJAM-73)
+    0, 0, 0, 0
 };
 
 // Single RGB565 framebuffer, matching the proven-stable FRUITJAM-04 display_test.
@@ -1089,8 +1091,22 @@ static void hid_keyboard_apply(const uint8_t *report) {
         };
         const bool k_f12 = newly(0x45), k_up = newly(0x52),
                    k_dn  = newly(0x51), k_ent = newly(0x28),
-                   k_esc = newly(0x29);
+                   k_esc = newly(0x29), k_f11 = newly(0x44);
         memcpy(pk_prev, codes, 6);
+
+        // FRUITJAM-73: F11 cycles PMODE 4 artifact colour, OFF -> phase A ->
+        // phase B -> OFF. Three states rather than a plain toggle: without OFF
+        // there is no way back to plain mono, and BOTH phases are needed because
+        // which one a given game expects is arbitrary, exactly as on real
+        // hardware. Handled before the modal check so it works whether or not the
+        // picker is open. F11 is unmapped in g_hid_to_dscan, so it cannot leak.
+        if (k_f11) {
+            int m = (coco_machine_get_artifact() + 1) % 3;
+            coco_machine_set_artifact(m);
+            if (Serial && Serial.availableForWrite() >= 48)
+                Serial.printf("[artifact: %s]\n",
+                              m == 0 ? "off" : m == 1 ? "phase A" : "phase B");
+        }
 
         if (k_f12) {
             g_pick_open = !g_pick_open;
