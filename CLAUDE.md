@@ -8,16 +8,22 @@ Don't duplicate them. This file is pointers and working conventions.
 
 ## Read this first
 
-**`docs/retrospective-2026-08-26.md`** — read it before touching the video path or picking up
-FRUITJAM-49 / -53 / -55. It records what shipped, five hypotheses proposed for the HSTX desync and
-which ones survived contact with evidence, and the measurement mistakes that cost the most time.
-Several conclusions that *read* as settled in commit messages are explicitly marked as not
-established there. Reading it first will save re-deriving a long session.
+**`docs/hstx-lessons.md`** — read before touching the video path. Field notes on driving DVI from
+HSTX: the command-list failure mode that latches (160 fps at 60p is the fingerprint), RP2350-E5,
+the code-layout sensitivity below, the theories that turned out wrong, and an honest for/against
+ledger on HSTX itself.
 
-The live thread is an **intermittent HSTX desync** (link runs at 159-161 fps instead of 60). Root
-cause is open (FRUITJAM-49). The highest-value untried step is a **cold-boot test**: behaviour
-degraded across a long session in a way no code change explains, on a board running for hours at
-252 MHz with vreg at 1.25 V.
+**`docs/retrospective-2026-08-26.md`** — historical. Useful for how the port got here, but several
+of its conclusions have since been overturned by measurement; it is superseded on the desync
+question by `hstx-lessons.md`. In particular its "behaviour degrades across a long session" theory
+and its cold-boot recommendation did **not** survive: a 25-hour run showed no degradation.
+
+**Desync status.** Two root causes were found and fixed — the resync was re-desyncing the link
+(RP2350-E5, FRUITJAM-49) and core-0 code layout was starving the HSTX FIFO (FRUITJAM-75/76).
+Standing baseline is **7.6 desyncs/hour over 25 hours**, each a brief flicker that recovers, versus
+"black screen until power-cycle" before. **Onset is still unexplained (FRUITJAM-58)** — the leading
+lead is that the rate tracks board *current* (a lit LED strip alone is worth ~3.5x), which makes
+power-rail integrity a live suspect rather than anything in the firmware.
 
 ## Measurement discipline (this repo has been burned by all of these)
 
@@ -34,6 +40,11 @@ degraded across a long session in a way no code change explains, on a board runn
   from 0/hr to 964/hr and cost +1.5 ms/field; moving `blit_frame()` to `.time_critical` RAM took it
   back to 31/hr. So **adding code is itself a variable** — an A/B of any change is invalid until the
   hot path is layout-immune, and `avg run` is not a clean measure of core-0 work either.
+- **The noise floor is large, and desyncs are episodic.** Idle in an *identical* configuration has
+  measured 20.6, 21.2 and 31.5/hr across ~20-minute windows, and three events have arrived inside
+  23 seconds. Treat anything under an hour per arm as indicative only, and define arms in advance
+  and flash them separately — segmenting one log by inferred machine state has produced wrong
+  conclusions here more than once.
 - **Boot-latched faults need many boot cycles, not one long run.**
 - **Verify before concluding, and before filing.** Reading the source has repeatedly turned a
   planned experiment into a no-op or answered a question before it was asked.
@@ -44,7 +55,10 @@ degraded across a long session in a way no code change explains, on a board runn
 |---|---|---|
 | `COCO_DVI_MODE` | 1 | DVI mode, no data islands. `0` = HDMI/precomposed (needed for FRUITJAM-14). |
 | `COCO_VDG_T1` | 0 | Original MC6847 font + part variant. `1` = 6847T1. |
-| `COCO_NEOPIXEL` | 0 | Boot progress LEDs. Off — see FRUITJAM-53. |
+| `COCO_NEOPIXEL` | 1 | Boot progress LEDs, left lit after boot. Costs ~15/hr desyncs (FRUITJAM-77). |
+| `COCO_DSK_WRITEBACK` | 0 | Persist disk writes to SD. Off pending FRUITJAM-88. |
+| `COCO_CROP_BORDER` | 0 | Crop the VDG border, scale 2.5x to fill 640x480 (FRUITJAM-61). |
+| `COCO_CROP_SMOOTH` | 2 | With the above: 0 hard, 1 linear, 2 boundary blend. |
 | `NEO_IDLE_CYCLE` | 0 | Idle colour cycle. Off — desyncs video, FRUITJAM-47. |
 | `SERIAL_READY_WAIT_MS` | 1000 | Boot wait for a serial host. `1500` for a guaranteed full boot log. |
 

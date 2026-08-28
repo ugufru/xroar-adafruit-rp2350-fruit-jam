@@ -53,23 +53,32 @@ against the schematic: **card-detect is GPIO33** (GPIO34 is SD_SCK), and the oth
 | Audio (TLV320 DAC) | ✅ working | CoCo `SOUND` audible on the 3.5 mm headphone jack over I2S |
 | microSD | ✅ working | SPI + FatFS; ROMs and disk/cassette images loaded from a FAT32 card |
 | Disk (`.dsk`) | ✅ working | WD2797 FDC + Disk BASIC cartridge; `DIR` / `LOAD` / `LOADM` / `RUN` off a JVC image |
-| Cassette (`.cas`) | 🚧 in progress | fresh FSK feeder → PIA1 for `CLOAD` (FRUITJAM-28) |
+| Cassette (`.cas`) | ✅ working | FSK feeder → PIA1 for `CLOAD`; drop `AUTO.CAS` in `/coco/tapes` (FRUITJAM-28) |
 | PSRAM (8 MB) | ✅ working | cold/bulk only (disk images, snapshots); kept out of the per-frame hot path |
-| Performance | ✅ locked | ~1.3× real-time idle, ~1.04× under heavy load, steady 59–60 fps |
-| Buttons / NeoPixels | ⬜ planned | board UI (FRUITJAM-16) |
-| Cassette **audio** (`.wav`/`.aiff`) | ⬜ planned | hear a tape via `MOTOR`/`AUDIO` (FRUITJAM-30) |
-| USB joystick / gamepad | ⬜ planned | FRUITJAM-18 |
+| Disk picker overlay | ✅ working | VDG-font list, buttons **or** F12/arrows/Enter; mounts, cold-boots and auto-runs (FRUITJAM-50/66/70/72) |
+| Last disk remembered | ✅ working | survives power-cycle via `/coco/lastdsk.txt` (FRUITJAM-71) |
+| PMODE 4 artifact colour | ✅ working | F11 cycles off → phase A → phase B (FRUITJAM-73) |
+| Buttons / NeoPixels | ✅ working | 3=up 2=mount+boot 1=down; boot-progress strip left lit (FRUITJAM-77) |
+| Disk **write-back** to SD | 🚧 gated off | mechanism verified, `COCO_DSK_WRITEBACK=0` pending FRUITJAM-88 |
+| Performance | ✅ locked | ~1.33× real-time idle (12.6 ms/field); steady 59–60 fps |
+| HSTX link stability | ✅ usable | ~7.6 desyncs/hr over 25 h, each a brief recovering flicker; onset open (FRUITJAM-58) |
+| USB joystick / gamepad | ⬜ planned | **next up** (FRUITJAM-18) |
+| Multi-drive (drives 1–3) | ⬜ planned | picker manages drive 0 only (FRUITJAM-78) |
+| ESP32-C6 co-processor | ⬜ planned | networked disk images, remote console, OTA (FRUITJAM-90) |
+| CoCo 3 (GIME) | ⬜ research | needs ~2× CPU throughput for fast mode; analysis in FRUITJAM-84 |
+| Cassette **audio** (`.wav`/`.aiff`) | ❌ out of scope | decided 2026-08-26 (FRUITJAM-30/34) |
 | HDMI audio (HSTX data islands) | ⬜ stretch | second audio sink alongside the DAC (FRUITJAM-14) |
-
-**Operating point:** 252 MHz system clock at 1.25 V core; `clk_hstx` = 126 MHz (FRUITJAM-03).
-252 MHz divides exactly for PIO-USB and serves HSTX 480p with room left for emulation.
 
 **Known issues:**
 - `mount_sd()` can hang on a loose / unresponsive microSD instead of timing out — reseat the card
   (FRUITJAM-26).
-- A rare lockup after long runs of a heavy program (KALEIDSC) is under investigation
-  (FRUITJAM-35); a non-blocking-serial fix and an on-board per-core heartbeat LED are in place to
-  pin it down.
+- Disk write-back to SD is gated off by default pending FRUITJAM-88; saves work within a session
+  and are lost on power-down.
+- HSTX desync onset is unexplained (FRUITJAM-58). Each event is a brief flicker that recovers;
+  the rate tracks board current, so a lit LED strip roughly triples it.
+
+**Operating point:** 252 MHz system clock at 1.25 V core; `clk_hstx` = 126 MHz (FRUITJAM-03).
+252 MHz divides exactly for PIO-USB and serves HSTX 480p with room left for emulation.
 
 ## Build and run
 

@@ -94,6 +94,41 @@ Observed under load:
 (SOUND) and ~29–33% at idle.** Acceptance met; further gains (wider hot set,
 clock) are optional and not currently needed.
 
+## 2026-08-27/28 update
+
+Two corrections and one new number.
+
+**The "~23% headroom is suspect" caveat is withdrawn.** It rested on FRUITJAM-38,
+which claimed core-0 field time steps 13.2 → 16.0 ms a couple of minutes after
+boot on any build. It does not. A 3.3-hour idle capture held `avg run` between
+12,383 and 13,175 µs and never approached 16,000, while 16.0 ms appeared
+immediately and repeatedly whenever a program was running. **The step is
+emulation load, not time-since-boot** — different opcodes cost different host
+time for the same fixed cycle budget. FRUITJAM-38 closed.
+
+**`avg run` is not a clean measure of core-0 work.** Moving one function to RAM
+changed it by 1.5 ms with no behavioural change, and adding *never-executed*
+code changed it by the same amount (FRUITJAM-75). Any figure here must be
+compared against a layout-immune build — see `docs/hstx-lessons.md` §3.
+
+**Current numbers**, core 0's whole per-field path in `.time_critical` RAM
+(FRUITJAM-76), idle at the BASIC prompt:
+
+| | before RAM move | after |
+|---|---|---|
+| `avg run` | 13,049 µs | **12,583 µs** |
+| `blit_frame` | 2,999 µs | **2,588 µs** |
+
+~465 µs/field recovered, and the timing no longer moves when unrelated code is
+added: adding 96 lines of dead flash-resident code shifted `avg run` by 38 µs
+(0.3%), against +1,500 µs (12%) before the fix.
+
+**Note on the timebase.** `CYCLES_PER_FRAME` (14,915) and `FRAME_US` (16,762)
+are derived from 60 Hz; NTSC is 59.94 Hz, giving 14,930 and 16,683. The 6809
+therefore runs ~0.57% slow against wall clock. The machine's *internal* timing
+is unaffected — field sync comes from the VDG event queue, not from these
+constants. FRUITJAM-83.
+
 ## Open perf items
 
 * Precise under-load benchmark (a fixed CPU-bound routine) would give a cleaner

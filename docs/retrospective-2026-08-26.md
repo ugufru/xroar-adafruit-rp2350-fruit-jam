@@ -6,6 +6,24 @@ before picking up FRUITJAM-49 / -53 / -55, which are the live threads.
 
 Range: `54fb1e2..50a878b` (13 commits) plus uncommitted work noted at the end.
 
+> **SUPERSEDED IN PART (2026-08-28).** Accurate as history, but several conclusions
+> below were overturned by later measurement. Read `docs/hstx-lessons.md` for the
+> current state of the desync question. Specifically:
+> - **FRUITJAM-49 is fixed** — the resync itself was re-desyncing the link, via a
+>   missing RP2350-E5 DMA-abort workaround.
+> - **"Behaviour degraded across a long session" did not hold.** A 25-hour run showed
+>   no degradation, and the recommended cold-boot test is correspondingly low value.
+>   The trajectory was better explained by code layout (FRUITJAM-75): those sessions
+>   reflashed constantly, and each build had a different core-0 flash layout, which
+>   alone swings the desync rate by three orders of magnitude.
+> - **The NeoPixel PIO theory is disproved** (FRUITJAM-53). The observation was real
+>   but the mechanism was wrong: the rate tracks strip *illumination*, i.e. current
+>   draw, not the state machine. Magnitude was overstated ~15x.
+> - **FRUITJAM-55 was closed as superseded** — with E5 fixed, the native path
+>   recovers, so there is no failure-mode difference left to buy.
+> - **FRUITJAM-38 is closed** — the core-0 timing step is emulation load, not a
+>   timer, so `perf-log.md`'s headroom figure is no longer suspect.
+
 ---
 
 ## 1. What shipped
