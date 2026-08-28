@@ -457,13 +457,27 @@ extern "C" _Bool coco_machine_cas_motor(void) { return g_cas_motor; }
 static const uint8_t *g_cart_rom = nullptr;
 static size_t   g_cart_len = 0;
 
-// Mounted JVC .dsk (mutable buffer for write-back; writes are not persisted to
-// the SD card yet -- they live in the in-RAM/PSRAM copy).
-static uint8_t *g_dsk = nullptr;
-static size_t   g_dsk_len = 0;
-static uint32_t g_dsk_hdr = 0;
-static int      g_dsk_spt = 18, g_dsk_sides = 1, g_dsk_secsz = 256, g_dsk_base = 1;
-static bool     g_dsk_wp = false;
+// Mounted JVC .dsk images, one per drive (FRUITJAM-78). Buffers are host-owned
+// and mutable for write-back.
+//
+// Four independent drives, because Disk BASIC addresses four and real software
+// expects a program disk in 0 with data in 1. Before this, DSKREG's drive select
+// was DECODED into g_fdc_drive but never USED: every drive number indexed the one
+// image, so `DIR 1` silently returned drive 0's directory rather than an error —
+// plausible-looking wrong data, which is worse than a failure.
+//
+// An UNASSIGNED drive now reports NOT READY (ST_NR), which is what a real
+// controller does with no disk in the bay, and is distinct from ST_RNF (a disk
+// is present but the sector was not found).
+#define COCO_NDRIVE 4
+static uint8_t *g_dsk[COCO_NDRIVE]     = { nullptr, nullptr, nullptr, nullptr };
+static size_t   g_dsk_len[COCO_NDRIVE] = { 0, 0, 0, 0 };
+static uint32_t g_dsk_hdr[COCO_NDRIVE] = { 0, 0, 0, 0 };
+static int      g_dsk_spt[COCO_NDRIVE]   = { 18, 18, 18, 18 };
+static int      g_dsk_sides[COCO_NDRIVE] = { 1, 1, 1, 1 };
+static int      g_dsk_secsz[COCO_NDRIVE] = { 256, 256, 256, 256 };
+static int      g_dsk_base[COCO_NDRIVE]  = { 1, 1, 1, 1 };
+static bool     g_dsk_wp[COCO_NDRIVE]    = { false, false, false, false };
 
 // WD2797 registers + transfer state.
 static uint8_t  g_fdc_status = 0, g_fdc_track = 0, g_fdc_sector = 0, g_fdc_data = 0;
@@ -483,12 +497,16 @@ static inline void fdc_halt(void) {
     if (g_m.cpu) g_m.cpu->halt = (g_halt_enable && !g_fdc_drq) ? 1 : 0;
 }
 
+// Offset within the CURRENTLY SELECTED drive's image. Geometry is per-drive: a
+// 35-track single-sided disk in 0 and a 40-track double-sided one in 1 is an
+// ordinary pairing, so spt/sides/base cannot be global.
 static inline long dsk_offset(int track, int side, int sector) {
-    if (!g_dsk) return -1;
-    if (sector < g_dsk_base || sector >= g_dsk_base + g_dsk_spt) return -1;
-    long lsn = ((long)track * g_dsk_sides + side) * g_dsk_spt + (sector - g_dsk_base);
-    long off = (long)g_dsk_hdr + lsn * g_dsk_secsz;
-    if (off < 0 || off + g_dsk_secsz > (long)g_dsk_len) return -1;
+    int d = g_fdc_drive;
+    if (!g_dsk[d]) return -1;
+    if (sector < g_dsk_base[d] || sector >= g_dsk_base[d] + g_dsk_spt[d]) return -1;
+    long lsn = ((long)track * g_dsk_sides[d] + side) * g_dsk_spt[d] + (sector - g_dsk_base[d]);
+    long off = (long)g_dsk_hdr[d] + lsn * g_dsk_secsz[d];
+    if (off < 0 || off + g_dsk_secsz[d] > (long)g_dsk_len[d]) return -1;
     return off;
 }
 
@@ -498,14 +516,20 @@ static inline long dsk_offset(int track, int side, int sector) {
 static coco_dsk_write_cb_t g_dsk_write_cb = NULL;
 extern "C" void coco_machine_set_dsk_write_callback(coco_dsk_write_cb_t cb) { g_dsk_write_cb = cb; }
 
+extern "C" int coco_machine_fdc_drive(void) { return g_fdc_drive; }
+
 static void fdc_finish(void) {
-    if (g_fdc_writing && g_dsk && !g_dsk_wp) {
+    int d = g_fdc_drive;
+    if (g_fdc_writing && g_dsk[d] && !g_dsk_wp[d]) {
         long off = dsk_offset(g_fdc_track, g_fdc_side, g_fdc_sector);
         if (off >= 0) {
-            memcpy(g_dsk + off, g_fdc_buf, g_dsk_secsz);
+            memcpy(g_dsk[d] + off, g_fdc_buf, g_dsk_secsz[d]);
             // Report, do not write. SD I/O here would block mid-instruction;
             // the host defers it to a field boundary (see flush_dsk_writes).
-            if (g_dsk_write_cb) g_dsk_write_cb((uint32_t)off, g_dsk_secsz);
+            // The DRIVE is reported too (FRUITJAM-87): with four images the host
+            // cannot infer which file an offset belongs to, and guessing would
+            // write one disk's sectors into another's file.
+            if (g_dsk_write_cb) g_dsk_write_cb(d, (uint32_t)off, g_dsk_secsz[d]);
         }
     }
     g_fdc_status = g_fdc_type1 ? (uint8_t)((g_fdc_track == 0) ? ST_TRK0 : 0)
@@ -543,7 +567,10 @@ static void fdc_command(uint8_t cmd) {
         fdc_halt();
         return;
     }
-    if (!g_dsk) { g_fdc_status = ST_NR; g_fdc_intrq = true; fdc_halt(); return; }
+    // Not-ready gate, now PER DRIVE (FRUITJAM-78). Sits ahead of the Type I
+    // seeks as well as the sector commands, so selecting an empty drive fails
+    // at the first command rather than seeking a head that is not there.
+    if (!g_dsk[g_fdc_drive]) { g_fdc_status = ST_NR; g_fdc_intrq = true; fdc_halt(); return; }
 
     g_fdc_type1 = (top <= 0x07);
     if (g_fdc_type1) {                     // Type I: head positioning
@@ -562,17 +589,17 @@ static void fdc_command(uint8_t cmd) {
     if (top == 0x08 || top == 0x09) {      // Read Sector
         long off = dsk_offset(g_fdc_track, g_fdc_side, g_fdc_sector);
         if (off < 0) { g_fdc_status = ST_RNF; g_fdc_intrq = true; fdc_halt(); return; }
-        memcpy(g_fdc_buf, g_dsk + off, g_dsk_secsz);
-        g_fdc_idx = 0; g_fdc_count = g_dsk_secsz; g_fdc_writing = false;
+        memcpy(g_fdc_buf, g_dsk[g_fdc_drive] + off, g_dsk_secsz[g_fdc_drive]);
+        g_fdc_idx = 0; g_fdc_count = g_dsk_secsz[g_fdc_drive]; g_fdc_writing = false;
         g_fdc_status = ST_BUSY;
         event_queue_dt(&g_fdc_event, FDC_CMD_TICKS);
         return;
     }
     if (top == 0x0A || top == 0x0B) {      // Write Sector
         long off = dsk_offset(g_fdc_track, g_fdc_side, g_fdc_sector);
-        if (off < 0)    { g_fdc_status = ST_RNF; g_fdc_intrq = true; fdc_halt(); return; }
-        if (g_dsk_wp)   { g_fdc_status = ST_WP;  g_fdc_intrq = true; fdc_halt(); return; }
-        g_fdc_idx = 0; g_fdc_count = g_dsk_secsz; g_fdc_writing = true;
+        if (off < 0)                { g_fdc_status = ST_RNF; g_fdc_intrq = true; fdc_halt(); return; }
+        if (g_dsk_wp[g_fdc_drive])  { g_fdc_status = ST_WP;  g_fdc_intrq = true; fdc_halt(); return; }
+        g_fdc_idx = 0; g_fdc_count = g_dsk_secsz[g_fdc_drive]; g_fdc_writing = true;
         g_fdc_status = ST_BUSY;
         event_queue_dt(&g_fdc_event, FDC_CMD_TICKS);
         return;
@@ -636,17 +663,29 @@ extern "C" void coco_machine_load_cart(const uint8_t *rom, size_t len) {
     g_cart_rom = rom; g_cart_len = len;
 }
 
-extern "C" void coco_machine_mount_dsk(uint8_t *buf, size_t len) {
-    g_dsk = buf; g_dsk_len = len;
+// Mount (or, with buf=NULL, eject) one drive. Geometry is re-derived per drive.
+extern "C" void coco_machine_mount_dsk_drive(int drive, uint8_t *buf, size_t len) {
+    if ((unsigned)drive >= COCO_NDRIVE) return;
+    g_dsk[drive] = buf; g_dsk_len[drive] = len;
     // JVC header = len % 256 bytes (0 for a plain 35-track single-sided image).
-    g_dsk_hdr = (uint32_t)(len % 256);
-    g_dsk_spt = 18; g_dsk_sides = 1; g_dsk_secsz = 256; g_dsk_base = 1;
+    g_dsk_hdr[drive]   = (uint32_t)(len % 256);
+    g_dsk_spt[drive]   = 18; g_dsk_sides[drive] = 1;
+    g_dsk_secsz[drive] = 256; g_dsk_base[drive] = 1;
     if (buf) {
-        if (g_dsk_hdr >= 1 && buf[0]) g_dsk_spt   = buf[0];
-        if (g_dsk_hdr >= 2 && buf[1]) g_dsk_sides = buf[1];
-        if (g_dsk_hdr >= 4)           g_dsk_base  = buf[3];
+        if (g_dsk_hdr[drive] >= 1 && buf[0]) g_dsk_spt[drive]   = buf[0];
+        if (g_dsk_hdr[drive] >= 2 && buf[1]) g_dsk_sides[drive] = buf[1];
+        if (g_dsk_hdr[drive] >= 4)           g_dsk_base[drive]  = buf[3];
     }
-    g_dsk_wp = false;
+    g_dsk_wp[drive] = false;
+}
+
+// Back-compat shim: the pre-FRUITJAM-78 single-drive entry point is drive 0.
+extern "C" void coco_machine_mount_dsk(uint8_t *buf, size_t len) {
+    coco_machine_mount_dsk_drive(0, buf, len);
+}
+
+extern "C" _Bool coco_machine_drive_assigned(int drive) {
+    return (unsigned)drive < COCO_NDRIVE && g_dsk[drive] != nullptr;
 }
 
 // - - - bus -------------------------------------------------------------------

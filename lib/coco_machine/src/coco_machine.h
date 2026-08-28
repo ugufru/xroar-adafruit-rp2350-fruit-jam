@@ -113,14 +113,27 @@ void coco_machine_load_cart(const uint8_t *rom, size_t len);
 // caller-owned and MUTABLE (sector writes go into it; not yet persisted to SD).
 // Geometry comes from the JVC header, else defaults (single-sided, 18 sectors,
 // 256-byte, sector base 1). Pass NULL/0 to unmount.
-void coco_machine_mount_dsk(uint8_t *buf, size_t len);
+void coco_machine_mount_dsk(uint8_t *buf, size_t len);      // drive 0 (shim)
+
+// Four independent drives (FRUITJAM-78). Disk BASIC addresses drives 0-3 via
+// DSKREG; buf=NULL ejects. An unassigned drive reports NOT READY to the FDC
+// rather than aliasing drive 0, which is what it did before this existed.
+#define COCO_NDRIVE 4
+void  coco_machine_mount_dsk_drive(int drive, uint8_t *buf, size_t len);
+_Bool coco_machine_drive_assigned(int drive);
+// DSKREG's current drive select — the drive the machine last addressed. The
+// overlay uses it to open on the drive the user is actually working with.
+int   coco_machine_fdc_drive(void);
 
 // FRUITJAM-81: called after the FDC writes a sector into the mounted image,
 // with that sector's byte offset and length. The data is already in the buffer
 // the caller passed to coco_machine_mount_dsk(), so nothing is copied. Do NOT
 // perform I/O from this callback - it runs mid-instruction, with the emulated
 // CPU halted waiting on the FDC. Record and defer.
-typedef void (*coco_dsk_write_cb_t)(uint32_t offset, uint32_t len);
+// Reports the DRIVE as well as the offset (FRUITJAM-87): with four images the
+// host cannot infer which file an offset belongs to, and guessing would write
+// one disk's sectors into another disk's file.
+typedef void (*coco_dsk_write_cb_t)(int drive, uint32_t offset, uint32_t len);
 void coco_machine_set_dsk_write_callback(coco_dsk_write_cb_t cb);
 
 // - - - cassette (.cas) playback (FRUITJAM-28) --------------------------------

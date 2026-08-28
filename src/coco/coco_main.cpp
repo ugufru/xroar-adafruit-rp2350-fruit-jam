@@ -458,20 +458,48 @@ static void neo_idle_cycle(void) {
 // Mounting is a DISK SWAP, not a reset: coco_machine_mount_dsk() swaps the image
 // pointer and re-derives JVC geometry, exactly what changing a floppy does. Disk
 // BASIC keeps running; DIR shows the new disk.
-#define PICKER_MAX 128   // 128 x 13 B name table; card had >32
+#define PICKER_MAX 128   // card had >32
+
+// FatFs is built with long filenames on (ffconf.h: FF_USE_LFN 3, FF_MAX_LFN
+// 255), so the old 12-char cap was self-imposed, not a FAT limit — it just
+// threw the long name away at scan time. 31 chars is what the 32-column overlay
+// can show beside the cursor and drive digit, and it keeps the mount path
+// ("0:/coco/dsk/" + name) inside g_dsk_path's 48 bytes.
+#define DSK_NAME_MAX 32          // 31 chars + NUL
+#define DSK_NAME_COLS 27         // 32 cols - 5 for the "N -> " prefix
 
 // Defined further down (with the other SD loaders / the PSRAM allocator block);
 // forward-declared here so the picker can sit next to the rest of the board UI.
 static size_t load_psram_file(const char *path, const uint8_t **out);
 void __psram_free(void *);   // C++ linkage, matching the core's psram.h
 
-static char     g_dsk_names[PICKER_MAX][13];
+static char     g_dsk_names[PICKER_MAX][DSK_NAME_MAX];
 static int      g_dsk_count = 0;
-static int      g_dsk_cur   = -1;      // index currently mounted, -1 = none
 static int      g_pick_sel  = 0;
 static bool     g_pick_open = false;
-static uint8_t *g_dsk_img   = nullptr; // PSRAM image backing the mounted disk
-static size_t   g_dsk_len   = 0;       // its length — needed to find the directory
+
+// FRUITJAM-78: four drives, tracked independently. g_dsk_cur[d] is the index
+// into g_dsk_names of the image assigned to drive d, -1 = unassigned.
+static int      g_dsk_cur[COCO_NDRIVE] = { -1, -1, -1, -1 };
+static uint8_t *g_dsk_img[COCO_NDRIVE] = { nullptr, nullptr, nullptr, nullptr };
+static size_t   g_dsk_len[COCO_NDRIVE] = { 0, 0, 0, 0 };
+
+// Which drive the overlay is currently assigning. Set from DSKREG when the
+// overlay opens, so it comes up on the drive the machine last addressed rather
+// than always on 0 — after a `DRIVE 1` + `DIR`, the overlay opens on drive 1.
+// The overlay has NO "current drive" mode. It is one list of the card's disks,
+// and 0-3 assign the highlighted disk to that drive — pressing the digit a
+// second time unassigns it. That removes the modal state entirely: there is no
+// drive to be "in", so nothing to step through and nothing to get lost in, and
+// the whole four-drive layout is set from one screen.
+//
+// It also makes [EMPTY] unnecessary: emptying a drive is the same keystroke
+// that filled it, so a dedicated row for it would be a second way to do one
+// thing. Rows are just the disks — no [CANCEL] either, since with ENTER inert
+// it was an unreachable row for the keyboard; the button path closes on the
+// 1+3 chord instead (see picker_task).
+#define PICK_COUNT        (g_dsk_count)
+
 
 // FRUITJAM-81: write-back. The FDC reports each sector it writes; we record the
 // offset and flush at a FIELD BOUNDARY, never from inside the emulation call.
@@ -485,17 +513,24 @@ static size_t   g_dsk_len   = 0;       // its length — needed to find the dire
 // data granules plus the directory and FAT), so 16 covers a normal save with
 // room to spare; overflow degrades to a FULL-IMAGE flush rather than silently
 // losing data.
+// FRUITJAM-87: the queue is PER DRIVE. A single shared queue held only one
+// g_dsk_path, so as soon as four drives existed a sector written on drive 1
+// would be flushed into drive 0's file — silent cross-disk corruption. Offsets
+// alone cannot say which image they belong to, which is why the FDC callback
+// now reports the drive.
 #define DSKW_MAX 16
-static char     g_dsk_path[48] = "";      // path of the mounted image, for write-back
-static uint32_t g_dskw_off[DSKW_MAX];
-static int      g_dskw_n = 0;
-static bool     g_dskw_overflow = false;
+static char     g_dsk_path[COCO_NDRIVE][48] = { "", "", "", "" };
+static uint32_t g_dskw_off[COCO_NDRIVE][DSKW_MAX];
+static int      g_dskw_n[COCO_NDRIVE] = { 0, 0, 0, 0 };
+static bool     g_dskw_overflow[COCO_NDRIVE] = { false, false, false, false };
 
-static void dsk_sector_written(uint32_t off, uint32_t len) {
+static void dsk_sector_written(int drive, uint32_t off, uint32_t len) {
     (void)len;
-    for (int i = 0; i < g_dskw_n; i++) if (g_dskw_off[i] == off) return;   // dedup
-    if (g_dskw_n >= DSKW_MAX) { g_dskw_overflow = true; return; }
-    g_dskw_off[g_dskw_n++] = off;
+    if ((unsigned)drive >= COCO_NDRIVE) return;
+    for (int i = 0; i < g_dskw_n[drive]; i++)
+        if (g_dskw_off[drive][i] == off) return;                       // dedup
+    if (g_dskw_n[drive] >= DSKW_MAX) { g_dskw_overflow[drive] = true; return; }
+    g_dskw_off[drive][g_dskw_n[drive]++] = off;
 }
 static char     g_pick_msg[40] = "";
 static bool     g_pick_dirty = false;   // redraw the overlay only when it changes
@@ -531,8 +566,8 @@ static void scan_dsk_dir(void) {
         if (fno.fname[0] == '.') continue;
         const char *ext = strrchr(fno.fname, '.');
         if (!ext || strcasecmp(ext, ".dsk") != 0) continue;
-        strncpy(g_dsk_names[g_dsk_count], fno.fname, 12);
-        g_dsk_names[g_dsk_count][12] = '\0';
+        strncpy(g_dsk_names[g_dsk_count], fno.fname, DSK_NAME_MAX - 1);
+        g_dsk_names[g_dsk_count][DSK_NAME_MAX - 1] = '\0';
         g_dsk_count++;
     }
     // Never truncate silently: say so if the card holds more than we can list.
@@ -553,30 +588,55 @@ static void scan_dsk_dir(void) {
 // and is named .txt so it cannot be mistaken for a disk image.
 #define LAST_DSK_PATH "0:/coco/lastdsk.txt"
 
-static void save_last_dsk(const char *name) {
+// FRUITJAM-78 extends this to FOUR lines, one per drive, in drive order; an
+// empty line means that drive is unassigned. Still bare filenames, still plain
+// text, still hand-editable, and still safe to delete.
+//
+// BACKWARD COMPATIBLE by construction: a pre-FRUITJAM-78 file is a single name
+// with no newline, which parses as "drive 0 = that name, 1-3 empty" — exactly
+// the old behaviour. No migration step, and downgrading simply reads the first
+// line and ignores the rest.
+static void save_dsk_assignments(char names[][DSK_NAME_MAX], const int *cur, int ndrive) {
     FIL f;
     if (f_open(&f, LAST_DSK_PATH, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
         // Not fatal — a read-only or full card just means no persistence.
         if (Serial && Serial.availableForWrite() >= 48)
-            Serial.println("[picker: could not save last-disk marker]");
+            Serial.println("[picker: could not save drive assignments]");
         return;
     }
     UINT bw = 0;
-    f_write(&f, name, strlen(name), &bw);
+    for (int d = 0; d < ndrive; d++) {
+        if (cur[d] >= 0) f_write(&f, names[cur[d]], strlen(names[cur[d]]), &bw);
+        f_write(&f, "\n", 1, &bw);
+    }
     f_close(&f);
 }
 
-static bool load_last_dsk(char *out, size_t n) {
+// Parse up to ndrive lines into out[d]. Returns how many drives got a name.
+static int load_dsk_assignments(char out[][DSK_NAME_MAX], int ndrive) {
+    for (int d = 0; d < ndrive; d++) out[d][0] = '\0';
     FIL f;
-    if (f_open(&f, LAST_DSK_PATH, FA_READ) != FR_OK) return false;
+    if (f_open(&f, LAST_DSK_PATH, FA_READ) != FR_OK) return 0;
+    char buf[COCO_NDRIVE * DSK_NAME_MAX + 8];
     UINT br = 0;
-    f_read(&f, out, (UINT)(n - 1), &br);
+    f_read(&f, buf, (UINT)(sizeof(buf) - 1), &br);
     f_close(&f);
-    out[br] = '\0';
-    // Tolerate a hand-edited file: strip trailing newline / whitespace.
-    while (br && (out[br - 1] == '\n' || out[br - 1] == '\r' || out[br - 1] == ' '))
-        out[--br] = '\0';
-    return br > 0;
+    buf[br] = '\0';
+    int found = 0, d = 0;
+    const char *p = buf;
+    while (d < ndrive && *p) {
+        const char *e = strchr(p, '\n');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n > DSK_NAME_MAX - 1) n = DSK_NAME_MAX - 1;
+        memcpy(out[d], p, n); out[d][n] = '\0';
+        // Tolerate a hand-edited file: strip trailing CR / whitespace.
+        while (n && (out[d][n - 1] == '\r' || out[d][n - 1] == ' ')) out[d][--n] = '\0';
+        if (n) found++;
+        d++;
+        if (!e) break;
+        p = e + 1;
+    }
+    return found;
 }
 
 // Write back the sectors the FDC has touched. Called from loop() at a field
@@ -599,44 +659,51 @@ static void flush_dsk_writes(bool all) {
     // SAVE/LOAD work within a session and are simply lost on power-down, which
     // is the behaviour before FRUITJAM-81.
     (void)all;
-    if (g_dskw_n || g_dskw_overflow) {
-        if (Serial && Serial.availableForWrite() >= 64)
-            Serial.printf("  [dsk: %d sector(s) NOT written back - COCO_DSK_WRITEBACK=0]\n",
-                          g_dskw_overflow ? -1 : g_dskw_n);
-        g_dskw_n = 0; g_dskw_overflow = false;
+    for (int d = 0; d < COCO_NDRIVE; d++) {
+        if (!g_dskw_n[d] && !g_dskw_overflow[d]) continue;
+        if (Serial && Serial.availableForWrite() >= 72)
+            Serial.printf("  [dsk%d: %d sector(s) NOT written back - COCO_DSK_WRITEBACK=0]\n",
+                          d, g_dskw_overflow[d] ? -1 : g_dskw_n[d]);
+        g_dskw_n[d] = 0; g_dskw_overflow[d] = false;
     }
     return;
 #else
-    if ((!g_dskw_n && !g_dskw_overflow) || !g_dsk_path[0] || !g_dsk_img) return;
-    FIL f;
-    if (f_open(&f, g_dsk_path, FA_WRITE) != FR_OK) {
-        if (Serial && Serial.availableForWrite() >= 48)
-            Serial.println("[dsk: write-back open failed]");
-        g_dskw_n = 0; g_dskw_overflow = false;      // do not spin on a dead card
-        return;
-    }
-    UINT bw = 0;
-    int wrote = 0;
-    if (g_dskw_overflow) {
-        // Lost track of which sectors changed — rewrite the whole image rather
-        // than persist a partial, inconsistent picture.
-        f_lseek(&f, 0);
-        f_write(&f, g_dsk_img, (UINT)g_dsk_len, &bw);
-        wrote = -1;
-    } else {
-        int n = all ? g_dskw_n : (g_dskw_n > 4 ? 4 : g_dskw_n);   // bound per field
-        for (int i = 0; i < n; i++) {
-            f_lseek(&f, g_dskw_off[i]);
-            f_write(&f, g_dsk_img + g_dskw_off[i], 256, &bw);
+    for (int d = 0; d < COCO_NDRIVE; d++) {
+        if ((!g_dskw_n[d] && !g_dskw_overflow[d]) || !g_dsk_path[d][0] || !g_dsk_img[d])
+            continue;
+        FIL f;
+        if (f_open(&f, g_dsk_path[d], FA_WRITE) != FR_OK) {
+            if (Serial && Serial.availableForWrite() >= 48)
+                Serial.printf("[dsk%d: write-back open failed]\n", d);
+            g_dskw_n[d] = 0; g_dskw_overflow[d] = false;   // do not spin on a dead card
+            continue;
         }
-        wrote = n;
-        for (int i = n; i < g_dskw_n; i++) g_dskw_off[i - n] = g_dskw_off[i];
-        g_dskw_n -= n;
+        UINT bw = 0;
+        int wrote = 0;
+        if (g_dskw_overflow[d]) {
+            // Lost track of which sectors changed — rewrite the whole image rather
+            // than persist a partial, inconsistent picture.
+            f_lseek(&f, 0);
+            f_write(&f, g_dsk_img[d], (UINT)g_dsk_len[d], &bw);
+            wrote = -1;
+        } else {
+            // Bound per field. The budget is PER DRIVE, which is deliberate: a
+            // field that touches two drives does at most 4 sectors on each,
+            // rather than starving the second drive behind the first.
+            int n = all ? g_dskw_n[d] : (g_dskw_n[d] > 4 ? 4 : g_dskw_n[d]);
+            for (int i = 0; i < n; i++) {
+                f_lseek(&f, g_dskw_off[d][i]);
+                f_write(&f, g_dsk_img[d] + g_dskw_off[d][i], 256, &bw);
+            }
+            wrote = n;
+            for (int i = n; i < g_dskw_n[d]; i++) g_dskw_off[d][i - n] = g_dskw_off[d][i];
+            g_dskw_n[d] -= n;
+        }
+        f_close(&f);
+        g_dskw_overflow[d] = false;
+        if (Serial && Serial.availableForWrite() >= 48)
+            Serial.printf("[dsk%d: wrote %s]\n", d, wrote < 0 ? "FULL IMAGE" : "sectors");
     }
-    f_close(&f);
-    g_dskw_overflow = false;
-    if (Serial && Serial.availableForWrite() >= 48)
-        Serial.printf("[dsk: wrote %s]\n", wrote < 0 ? "FULL IMAGE" : "sectors");
 #endif
 }
 
@@ -645,23 +712,46 @@ static void flush_dsk_writes(bool all) {
 // remember=true persists the choice (FRUITJAM-71); boot passes false, because
 // restoring a disk is not the user choosing it and would rewrite the marker
 // identically on every boot.
-static bool mount_dsk_index(int i, bool remember) {
+// Empty a drive: free its image and tell the FDC there is no disk, so the drive
+// reports NOT READY exactly as an unassigned one does after a cold boot.
+static void eject_drive(int drive, bool remember) {
+    if ((unsigned)drive >= COCO_NDRIVE) return;
+    flush_dsk_writes(true);                 // do not strand unwritten sectors
+    if (g_dsk_img[drive]) __psram_free(g_dsk_img[drive]);
+    g_dsk_img[drive]  = nullptr;
+    g_dsk_len[drive]  = 0;
+    g_dsk_cur[drive]  = -1;
+    g_dsk_path[drive][0] = '\0';
+    g_dskw_n[drive] = 0; g_dskw_overflow[drive] = false;
+    coco_machine_mount_dsk_drive(drive, nullptr, 0);
+    if (remember) save_dsk_assignments(g_dsk_names, g_dsk_cur, COCO_NDRIVE);
+    snprintf(g_pick_msg, sizeof(g_pick_msg), "DR%d EMPTY", drive);
+}
+
+// Row to sit on when the overlay opens: whatever is in drive 0, else the top.
+static int pick_row_for_drive(int drive) {
+    return (g_dsk_cur[drive] >= 0) ? g_dsk_cur[drive] : 0;
+}
+
+static bool mount_dsk_index(int i, int drive, bool remember) {
     if (i < 0 || i >= g_dsk_count) return false;
+    if ((unsigned)drive >= COCO_NDRIVE) return false;
     char path[48];
     snprintf(path, sizeof(path), "0:/coco/dsk/%s", g_dsk_names[i]);
     const uint8_t *img = nullptr;
     size_t len = load_psram_file(path, &img);
     if (!len) { snprintf(g_pick_msg, sizeof(g_pick_msg), "LOAD FAILED"); return false; }
-    if (g_dsk_img) __psram_free(g_dsk_img);
-    g_dsk_img = (uint8_t *)img;
-    g_dsk_len = len;
-    // A swap abandons any unflushed sectors for the OLD image, so flush first.
+    // Flush BEFORE freeing: a swap abandons any unflushed sectors for the image
+    // being replaced, and after the free its buffer is gone.
     flush_dsk_writes(true);
-    snprintf(g_dsk_path, sizeof(g_dsk_path), "%s", path);
-    g_dsk_cur = i;
-    coco_machine_mount_dsk(g_dsk_img, len);
-    if (remember) save_last_dsk(g_dsk_names[i]);
-    snprintf(g_pick_msg, sizeof(g_pick_msg), "MOUNTED %s", g_dsk_names[i]);
+    if (g_dsk_img[drive]) __psram_free(g_dsk_img[drive]);
+    g_dsk_img[drive] = (uint8_t *)img;
+    g_dsk_len[drive] = len;
+    snprintf(g_dsk_path[drive], sizeof(g_dsk_path[drive]), "%s", path);
+    g_dsk_cur[drive] = i;
+    coco_machine_mount_dsk_drive(drive, g_dsk_img[drive], len);
+    if (remember) save_dsk_assignments(g_dsk_names, g_dsk_cur, COCO_NDRIVE);
+    snprintf(g_pick_msg, sizeof(g_pick_msg), "DR%d = %s", drive, g_dsk_names[i]);
     return true;
 }
 
@@ -676,13 +766,14 @@ static bool mount_dsk_index(int i, bool remember) {
 // [12] ASCII flag. First byte 0xFF ends the directory, 0x00 marks deleted.
 // Types: 0 = BASIC, 1 = BASIC data, 2 = machine language, 3 = text source. Only
 // 0 and 2 are runnable, so a data file sitting first cannot win.
-static bool dsk_first_program(char *out, size_t outn, int *type_out) {
-    if (!g_dsk_img || !g_dsk_len) return false;
-    size_t hdr = g_dsk_len % 256;      // same JVC rule coco_machine_mount_dsk uses
+static bool dsk_first_program(int drive, char *out, size_t outn, int *type_out) {
+    if ((unsigned)drive >= COCO_NDRIVE) return false;
+    if (!g_dsk_img[drive] || !g_dsk_len[drive]) return false;
+    size_t hdr = g_dsk_len[drive] % 256;   // same JVC rule the mount uses
     for (int sec = 3; sec <= 11; sec++) {
         size_t off = hdr + (17u * 18u + (size_t)(sec - 1)) * 256u;
-        if (off + 256 > g_dsk_len) return false;
-        const uint8_t *sp = g_dsk_img + off;
+        if (off + 256 > g_dsk_len[drive]) return false;
+        const uint8_t *sp = g_dsk_img[drive] + off;
         for (int e = 0; e < 8; e++) {
             const uint8_t *d = sp + e * 32;
             if (d[0] == 0xFF) return false;
@@ -763,7 +854,11 @@ static int g_autorun_ok = 0;
 
 static void autorun_start(void) {
     char name[16]; int type = 0;
-    if (!dsk_first_program(name, sizeof(name), &type)) {
+    // DRIVE 0 specifically, not whichever drive was just assigned: the command
+    // typed below is a bare RUN"NAME", which RSDOS resolves against its DEFAULT
+    // drive. Reading the directory of drive 1 and then typing a command that
+    // searches drive 0 would name a program the machine cannot find.
+    if (!dsk_first_program(0, name, sizeof(name), &type)) {
         if (Serial && Serial.availableForWrite() >= 48)
             Serial.println("[autorun: no runnable program in directory]");
         return;
@@ -791,22 +886,24 @@ extern "C" const uint8_t font_6847[];
 #define OVL_COLS (COCO_VDG_W / 8)    // 32
 #define OVL_ROWS (COCO_VDG_H / 12)   // 16
 
-// FRUITJAM-70: the picker list is the disks PLUS a trailing [CANCEL] row.
+// The picker list is just the disks (FRUITJAM-78).
 //
-// Buttons are the no-keyboard path, so every action has to be reachable from
-// the three buttons alone — and cancel was not. ESC and F12 both need a
-// keyboard, and button 2 always commits, which since FRUITJAM-69 also means a
-// COLD BOOT. Opening the picker by accident with no keyboard attached left no
-// way out but to mount something and reboot.
+// It carried a trailing [CANCEL] row from FRUITJAM-70, whose purpose was to give
+// the NO-KEYBOARD path a cancel: ESC and F12 both need a keyboard, and button 2
+// always commits, which since FRUITJAM-69 also means a COLD BOOT — so opening
+// the picker by accident with no keyboard left no way out but to mount
+// something and reboot. FRUITJAM-70 chose a list row over a chord because a row
+// is discoverable and needs no new gesture.
 //
-// A long-press or a chord would have worked but neither is discoverable, which
-// matters most on the device that has no keyboard to tell you otherwise. A row
-// in the list needs no new gesture, documents itself, and sits one press from
-// the top of the list because the selection wraps: UP from the first disk lands
-// on it. It also fixes the empty case — with no disks at all the list is just
-// [CANCEL], where before it was an unescapable empty box.
-#define PICK_COUNT        (g_dsk_count + 1)
-#define PICK_IS_CANCEL(i) ((i) >= g_dsk_count)
+// FRUITJAM-78 removed the row, because assignment moved to the 0-3 keys and
+// ENTER went inert: the row became unreachable from the keyboard and existed
+// only for button 2. The no-keyboard exit it provided is REAL and still
+// required, so it moved to the outer-button chord in picker_task rather than
+// being dropped. That reintroduces the discoverability cost FRUITJAM-70 was
+// avoiding — an undocumented chord — which is tracked in FRUITJAM-67.
+//
+// Note the empty case it also used to cover: with no .dsk files the list is now
+// empty, so the overlay prints NO .DSK FILES and the chord is the way out.
 
 static void fb_char(int cx, int cy, char c, uint16_t fg, uint16_t bg) {
     if (c >= 'a' && c <= 'z') c -= 32;
@@ -845,11 +942,14 @@ static void fb_text(int cx, int cy, const char *s, uint16_t fg, uint16_t bg) {
 
 // Drawn over the emulator frame each field while the picker is open.
 static void draw_picker(void) {
-    const uint16_t fg  = g_pal[0];    // reuse the machine palette
-    const uint16_t hi  = g_pal[8];
-    const uint16_t bg  = g_pal[9];
+    // Reuse the machine palette. The selection is TRUE REVERSE VIDEO — black on
+    // green — not the old dark-green-on-black, which paired the two darkest
+    // entries in the palette and read as dimmed rather than highlighted.
+    const uint16_t fg  = g_pal[0];    // green      — normal text
+    const uint16_t hi  = g_pal[8];    // black      — text on the selected row
+    const uint16_t bg  = g_pal[9];    // dark green — panel background
     const int      COLS = OVL_COLS;             // 32, the CoCo text width
-    const int      rows_visible = 12;
+    const int      rows_visible = 13;   // rows 2-14; 0 = title, 1 = spacer, 15 = status
 
     char line[OVL_COLS + 1];
     for (int i = 0; i < COLS; i++) line[i] = ' ';
@@ -864,24 +964,55 @@ static void draw_picker(void) {
     if (top > PICK_COUNT - rows_visible) top = PICK_COUNT - rows_visible;
     if (top < 0) top = 0;
 
-    fb_text(0, 0, "SELECT DISK", fg, bg);
-    fb_text(0, 1, "UP=3 DN=1 MNT+BOOT=2 ESC=CANCEL", fg, bg);
+    // Header names the drive being assigned, because with four drives the list
+    // alone is ambiguous — the same disk list means something different
+    // depending on which drive it lands in.
+    char hdr[OVL_COLS + 1];
+    // Title as a full-width bar. The key legends are gone: they cost two of
+    // sixteen rows permanently to teach four keys once.
+    snprintf(hdr, sizeof(hdr), " DSK DRIVE ASSIGNMENTS");
+    for (size_t k = strlen(hdr); k < (size_t)COLS; k++) hdr[k] = ' ';
+    hdr[COLS] = '\0';
+    // Green on black: a recessed bar, which stays inside the CoCo green scheme
+    // and still reads as distinct from the selection's bright green bar below.
+    fb_text(0, 0, hdr, fg, hi);
 
     for (int r = 0; r < rows_visible; r++) {
         int i = top + r;
         for (int c = 0; c < COLS; c++) line[c] = ' ';
-        if (i == g_dsk_count) {
-            snprintf(line, sizeof(line), "%s[CANCEL]", (i == g_pick_sel) ? ">" : " ");
-        } else if (i < g_dsk_count) {
-            const char *mark = (i == g_dsk_cur) ? "*" : " ";
-            snprintf(line, sizeof(line), "%s%-12s%s", (i == g_pick_sel) ? ">" : " ",
-                     g_dsk_names[i], mark);
+        if (i < g_dsk_count) {
+            // "N -> NAME". The drive digit sits to the LEFT of the name, so the
+            // digits read down the edge as the whole drive map at a glance —
+            // which a trailing marker could not do with names of varying length.
+            // A disk assigned to more than one drive shows the lowest.
+            //
+            // The arrow is drawn ONLY on assigned rows: a bare "-> NAME" with no
+            // number ahead of it reads as a dangling arrow, so unassigned rows
+            // get plain indent instead. No cursor character — the reverse-video
+            // bar is the selection, and a '>' beside it was redundant.
+            // Columns 0-3 are the four DRIVES, one fixed column each: column d
+            // shows the digit d when drive d holds this disk, blank otherwise.
+            //
+            // A fixed column per drive rather than one shared digit, because a
+            // disk can legitimately sit in more than one drive and a single
+            // column could only ever show one of them. Here "0 2  " reads
+            // directly as "drives 0 and 2", and because each drive owns a fixed
+            // column, scanning straight down column d shows where drive d is —
+            // and that at most one row in it can be lit.
+            char pre[COCO_NDRIVE + 2];
+            for (int d = 0; d < COCO_NDRIVE; d++)
+                pre[d] = (g_dsk_cur[d] == i) ? (char)('0' + d) : ' ';
+            pre[COCO_NDRIVE]     = ' ';
+            pre[COCO_NDRIVE + 1] = '\0';
+            snprintf(line, sizeof(line), "%s%-*.*s", pre,
+                     DSK_NAME_COLS, DSK_NAME_COLS, g_dsk_names[i]);
         }
-        fb_text(0, 2 + r, line, (i == g_pick_sel) ? bg : fg, (i == g_pick_sel) ? hi : bg);
+        // Selected row: black on green, and the line is padded to the full 32
+        // columns above so the highlight reads as a solid bar.
+        fb_text(0, 2 + r, line, (i == g_pick_sel) ? hi : fg, (i == g_pick_sel) ? fg : bg);
     }
-    // Below the list, not at row 2 — row 2 is now the [CANCEL] entry.
-    if (g_dsk_count == 0) fb_text(0, 2 + rows_visible, "NO .DSK FILES IN /COCO/DSK", fg, bg);
-    if (g_pick_msg[0])    fb_text(0, 2 + rows_visible + 1, g_pick_msg, fg, bg);
+    if (g_dsk_count == 0) fb_text(0, 2, "NO .DSK FILES IN /COCO/DSK", fg, bg);
+    if (g_pick_msg[0])    fb_text(0, 2 + rows_visible, g_pick_msg, fg, bg);
 }
 
 // Poll the buttons and drive the picker. Called once per field from loop().
@@ -892,6 +1023,20 @@ static void RAM_FUNC picker_task(void) {
     bool next = btn_fell(g_btn[0]);   // button 1 -> down / next
     bool sel  = btn_fell(g_btn[1]);   // button 2 -> mount + warm reset
     bool prev = btn_fell(g_btn[2]);   // button 3 -> up / prev
+
+    // FRUITJAM-67: BOTH OUTER BUTTONS HELD closes the overlay with no mount and
+    // no reboot. This replaces the [CANCEL] row, and it has to exist: every
+    // other button-2 press mounts a disk and cold-boots, so without it a user
+    // with no keyboard could not leave the picker without rebooting into some
+    // disk. Buttons are active low, and btn_fell() has already debounced
+    // .last this pass, so it doubles as the current held level.
+    //
+    // Checked BEFORE the no-edge early return below, because a chord is a HELD
+    // state and may present no new edge on the pass that completes it.
+    if (g_pick_open && !g_btn[0].last && !g_btn[2].last) {
+        g_pick_open = false; g_pick_dirty = true;
+        return;
+    }
     if (!sel && !prev && !next) return;
 
     if (Serial && Serial.availableForWrite() >= 48)
@@ -904,7 +1049,15 @@ static void RAM_FUNC picker_task(void) {
                       (int)g_pick_open, g_pick_sel, g_dsk_count);
 
     if (prev || next) {
-        if (!g_pick_open) { g_pick_open = true; g_pick_msg[0] = '\0'; g_pick_dirty = true; return; }
+        if (!g_pick_open) {
+            g_pick_open = true; g_pick_msg[0] = '\0'; g_pick_dirty = true;
+            // Same rule as the keyboard path: open on the drive DSKREG says the
+            // machine last addressed.
+            int d0 = coco_machine_fdc_drive();
+            if ((unsigned)d0 >= COCO_NDRIVE) d0 = 0;
+            g_pick_sel = pick_row_for_drive(d0);
+            return;
+        }
         g_pick_dirty = true;
         g_pick_sel += next ? 1 : -1;
         if (g_pick_sel < 0)            g_pick_sel = PICK_COUNT - 1;
@@ -912,11 +1065,19 @@ static void RAM_FUNC picker_task(void) {
         return;
     }
     if (sel) {
-        if (!g_pick_open) { g_pick_open = true; g_pick_msg[0] = '\0'; g_pick_dirty = true; return; }
-        // [CANCEL] closes with no mount and no reboot — the only way out of the
-        // picker when no keyboard is attached.
-        if (PICK_IS_CANCEL(g_pick_sel)) { g_pick_open = false; return; }
-        mount_dsk_index(g_pick_sel, true);
+        if (!g_pick_open) {
+            g_pick_open = true; g_pick_msg[0] = '\0'; g_pick_dirty = true;
+            // Same rule as the keyboard path: open on the drive DSKREG says the
+            // machine last addressed.
+            int d0 = coco_machine_fdc_drive();
+            if ((unsigned)d0 >= COCO_NDRIVE) d0 = 0;
+            g_pick_sel = pick_row_for_drive(d0);
+            return;
+        }
+        // Button 2 assigns DRIVE 0 and cold-boots. The digit keys that drive
+        // the four-drive assignment are unreachable without a keyboard, so the
+        // button path stays what it has always been: pick a disk, boot it.
+        mount_dsk_index(g_pick_sel, 0, true);
         // FRUITJAM-66/69: button 2 mounts and then FULLY restarts — a cold boot
         // with the selected disk in the drive, not a floppy swapped under a
         // running DOS. Warm reset was not enough: it preserves RAM, so BASIC
@@ -1209,6 +1370,14 @@ static void hid_keyboard_apply(const uint8_t *report) {
         const bool k_f12 = newly(0x45), k_up = newly(0x52),
                    k_dn  = newly(0x51), k_ent = newly(0x28),
                    k_esc = newly(0x29), k_f11 = newly(0x44);
+        // HID 0x1E-0x21 are '1'..'4'; 0x27 is '0'. Only read while the overlay
+        // is open, so the digits stay ordinary typing the rest of the time.
+        int k_drive = -1;
+        if      (newly(0x27)) k_drive = 0;
+        else if (newly(0x1E)) k_drive = 1;
+        else if (newly(0x1F)) k_drive = 2;
+        else if (newly(0x20)) k_drive = 3;
+
         memcpy(pk_prev, codes, 6);
 
         // FRUITJAM-73: F11 cycles PMODE 4 artifact colour, OFF -> phase A ->
@@ -1225,11 +1394,22 @@ static void hid_keyboard_apply(const uint8_t *report) {
                               m == 0 ? "off" : m == 1 ? "phase A" : "phase B");
         }
 
+        // F12 OPENS the overlay, and once open STEPS THROUGH THE DRIVES
+        // (0->1->2->3->0) rather than closing it. Closing is ESC's job alone.
+        // That makes F12 a single "next drive" key, so assigning all four is one
+        // visit — press F12 to advance, ENTER to assign, repeat — instead of
+        // reopening the overlay once per drive.
+        // F12 toggles the overlay. Assignment is 0-3, so F12 has no second job.
         if (k_f12) {
-            g_pick_open = !g_pick_open;
+            g_pick_open  = !g_pick_open;
             g_pick_dirty = true;
             if (g_pick_open) {
                 g_pick_msg[0] = '\0';
+                // Open on whatever the machine last addressed (DSKREG), so after
+                // `DRIVE 1` + `DIR` the highlight starts on drive 1's disk.
+                int d = coco_machine_fdc_drive();
+                if ((unsigned)d >= COCO_NDRIVE) d = 0;
+                g_pick_sel = pick_row_for_drive(d);
                 // Drop anything the emulator currently thinks is held, or a key
                 // down at the moment F12 arrives would stay stuck for the whole
                 // time the picker is up.
@@ -1264,17 +1444,26 @@ static void hid_keyboard_apply(const uint8_t *report) {
                 memcpy(g_prev_codes, codes, 6);
                 return;
             }
-            if (k_up || k_dn) {
+            // 0-3 switch which drive is being assigned. The selection follows
+            // that drive's current image, so switching drives shows you what is
+            // in the one you moved to rather than stranding the cursor.
+            // 0-3 TOGGLE the highlighted disk in that drive: assign it, or
+            // unassign if it is already the one there. One key does both, so
+            // emptying a drive needs no separate gesture or row.
+            if (k_drive >= 0 && g_dsk_count) {
+                if (g_dsk_cur[k_drive] == g_pick_sel) eject_drive(k_drive, true);
+                else                                  mount_dsk_index(g_pick_sel, k_drive, true);
+                g_pick_dirty = true;
+            }
+            if ((k_up || k_dn) && g_dsk_count) {
                 g_pick_sel += k_dn ? 1 : -1;
                 if (g_pick_sel < 0)           g_pick_sel = PICK_COUNT - 1;
                 if (g_pick_sel >= PICK_COUNT) g_pick_sel = 0;
                 g_pick_dirty = true;
             }
-            if (k_ent) {
-                // ENTER on [CANCEL] closes without mounting, same as ESC.
-                if (!PICK_IS_CANCEL(g_pick_sel)) mount_dsk_index(g_pick_sel, true);
-                g_pick_open = false;
-            }
+            // ENTER is deliberately inert: assignment is 0-3 and closing is
+            // F12 or ESC. It stays swallowed rather than reaching the machine.
+            (void)k_ent;
             return;               // modal: swallow everything else
         }
     }
@@ -1659,25 +1848,41 @@ void setup() {
         // back to an index needs the list to exist.
         scan_dsk_dir();
 
-        // FRUITJAM-71 precedence: the disk the user last mounted, then AUTO.DSK,
-        // then coco.dsk. The user's most recent explicit choice outranks the
-        // static AUTO.DSK marker; delete lastdsk.txt to fall back to it.
+        // FRUITJAM-71/78 precedence: the saved per-drive assignments, then
+        // AUTO.DSK in drive 0, then coco.dsk. The user's most recent explicit
+        // choice outranks the static AUTO.DSK marker; delete lastdsk.txt to
+        // fall back to it.
+        char saved[COCO_NDRIVE][DSK_NAME_MAX];
+        load_dsk_assignments(saved, COCO_NDRIVE);
+        int  restored = 0;
+
+        // Drives 1-3 first: they are pure restore, with no AUTO.DSK fallback and
+        // no autorun, so they cannot affect how drive 0 is chosen below.
+        for (int d = 1; d < COCO_NDRIVE; d++) {
+            if (!saved[d][0]) continue;
+            int idx = -1;
+            for (int i = 0; i < g_dsk_count; i++)
+                if (strcasecmp(g_dsk_names[i], saved[d]) == 0) { idx = i; break; }
+            if (idx >= 0 && mount_dsk_index(idx, d, false)) restored++;
+            else if (Serial && Serial.availableForWrite() >= 64)
+                Serial.printf("[drive %d disk '%s' not on card] ", d, saved[d]);
+        }
+
         int  want = -1, from_last = 0;
-        char last[16];
-        if (load_last_dsk(last, sizeof(last))) {
+        if (saved[0][0]) {
             from_last = 1;
             for (int i = 0; i < g_dsk_count; i++)
-                if (strcasecmp(g_dsk_names[i], last) == 0) { want = i; break; }
+                if (strcasecmp(g_dsk_names[i], saved[0]) == 0) { want = i; break; }
             // A remembered disk that has since been removed from the card falls
             // through to AUTO.DSK rather than failing to boot.
             if (want < 0 && Serial && Serial.availableForWrite() >= 64)
-                Serial.printf("[last disk '%s' not on card] ", last);
+                Serial.printf("[last disk '%s' not on card] ", saved[0]);
         }
         if (want < 0)
             for (int i = 0; i < g_dsk_count; i++)
-                if (strcasecmp(g_dsk_names[i], "AUTO.DSK") == 0) { want = i; break; }
+                if (strcasecmp(g_dsk_names[i], "AUTO.DSK") == 0) { want = i; from_last = 0; break; }
 
-        if (want >= 0 && mount_dsk_index(want, false)) {
+        if (want >= 0 && mount_dsk_index(want, 0, false)) {
             // Say WHY this disk was chosen — otherwise a remembered disk and a
             // plain AUTO.DSK boot are indistinguishable in the log.
             Serial.printf("[disk mounted: %s (%s) -> DIR/LOAD] ", g_dsk_names[want],
@@ -1685,14 +1890,15 @@ void setup() {
         } else {
             const uint8_t *dsk_img = nullptr;
             size_t dsk = load_psram_file("0:/coco/roms/coco.dsk", &dsk_img);
-            if (dsk) { g_dsk_img = (uint8_t *)dsk_img;  // FRUITJAM-50: picker frees this on swap
-                       g_dsk_len = dsk;
-                       coco_machine_mount_dsk(g_dsk_img, dsk);
+            if (dsk) { g_dsk_img[0] = (uint8_t *)dsk_img;  // FRUITJAM-50: picker frees this on swap
+                       g_dsk_len[0] = dsk;
+                       coco_machine_mount_dsk_drive(0, g_dsk_img[0], dsk);
                        Serial.printf("[disk mounted: coco.dsk %u bytes -> DIR/LOAD] ", (unsigned)dsk); }
         }
-        // Open the picker on whatever is mounted, so the highlight and the drive
-        // agree the first time it is opened.
-        g_pick_sel = (g_dsk_cur >= 0) ? g_dsk_cur : 0;
+        if (restored) Serial.printf("[drives 1-3: %d restored] ", restored);
+        // Open the picker on whatever is in drive 0, so the highlight and the
+        // drive agree the first time it is opened.
+        g_pick_sel   = pick_row_for_drive(0);
         if (g_dsk_count) Serial.printf("[picker: %d .dsk] ", g_dsk_count);
     }
     // Optional: drop a DECB .bin at 0:/coco/bin/AUTO.BIN to auto-run it on boot.
