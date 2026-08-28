@@ -136,6 +136,14 @@ _Bool coco_machine_cas_motor(void);   // diagnostic: cassette motor relay state
 
 // Keyboard injection by XRoar DSCAN_* code (see xroar_core dkbd.h). All keys
 // released at init. FRUITJAM-12 maps USB HID onto this.
+// Joysticks (FRUITJAM-18). Port 0 = RIGHT stick (fire on PIA0 PA0), port 1 =
+// LEFT (PA1); axis 0 = X (0 left, 65535 right), axis 1 = Y (0 up, 65535 down).
+// Axes are 16-bit to match the emulated comparator's own resolution — see the
+// note in coco_machine.cpp. Centre is 32767; all axes start centred, fire clear.
+void coco_machine_set_joystick_axis(int port, int axis, uint16_t value);
+void coco_machine_set_joystick_fire(int port, _Bool pressed);
+void coco_machine_release_all_joysticks(void);
+
 void coco_machine_press_key(uint8_t dscan);
 void coco_machine_release_key(uint8_t dscan);
 void coco_machine_release_all_keys(void);

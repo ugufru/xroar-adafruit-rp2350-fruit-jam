@@ -1303,23 +1303,152 @@ static void hid_keyboard_apply(const uint8_t *report) {
     memcpy(g_prev_codes, codes, 6);
 }
 
+// FRUITJAM-18 step 0: identify what actually enumerated, before writing any
+// gamepad mapping. Confirmed by reading TinyUSB hid_host.c: itf_protocol is only
+// populated for HID_SUBCLASS_BOOT interfaces (:524) and SET_PROTOCOL is only
+// issued when it is non-NONE (:581), so tuh_hid_set_default_protocol(BOOT) never
+// touches a gamepad — it stays in report mode, and reads back as protocol NONE.
+// That makes "protocol == NONE" the gamepad discriminator here.
+// Raw-report logging. Default OFF: it is a bring-up aid, and per CLAUDE.md
+// serial load is itself a variable in this repo. Set to 1 to identify a new pad.
+#ifndef COCO_JOY_PROBE
+#define COCO_JOY_PROBE 0
+#endif
+
+// - - - gamepad -> CoCo joysticks (FRUITJAM-18) -------------------------------
+// Report layout MEASURED on the user's pad (VID 054C PID 09CC, the DualShock 4
+// identity of a multi-mode pad; it also enumerates as 057E:2009 Switch Pro, which
+// sends no input reports without a handshake and is deliberately NOT supported).
+// Every field below was confirmed by pressing the control and reading the bytes,
+// not taken from a datasheet:
+//
+//   b0  report ID, always 0x01
+//   b1  LX   00 = left,  80 = centre, FF = right
+//   b2  LY   00 = up,    80 = centre, FF = down
+//   b3  RX,  b4 RY   (same convention)
+//   b5  low nibble  = D-pad hat: 0=N 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW, 0x0F = idle
+//       high nibble = face buttons, bit4 square, bit5 cross, bit6 circle, bit7 triangle
+//   b6  bit0 L1, bit1 R1, bit2 L2, bit3 R2, bit6 L3, bit7 R3
+//   b8/b9  L2 / R2 analog
+//
+// NOTE the hat idle value is 0x0F, not the 0x08 a stock DS4 reports — hence the
+// ">= 8 means centred" test rather than a compare against 8.
+//
+// MAPPING (FRUITJAM-18, as specified): left stick -> RIGHT CoCo joystick (port 0,
+// the one nearly all software reads), right stick -> LEFT (port 1). The D-pad
+// OVERRIDES the left stick when pressed, snapped to the rail, so the pad is
+// usable even in digital mode where the sticks read dead-centre.
+#define DS4_VID 0x054C
+#define DS4_PID 0x09CC
+
+static uint8_t g_pad_daddr = 0;      // 0 = no pad bound
+static uint8_t g_pad_idx   = 0;
+
+// The sticks on this pad rest a long way off centre and jitter (measured: LX
+// wandering across most of its range while untouched). A raw pass-through would
+// leave the emulated stick permanently deflected, so anything within DEADZONE of
+// centre is forced to exact centre. 0x18 of 0x80 is wide enough to swallow the
+// observed drift without eating real travel.
+#define PAD_DEADZONE 0x18
+
+static inline uint16_t pad_axis(uint8_t v) {
+    int d = (int)v - 0x80;
+    if (d > -PAD_DEADZONE && d < PAD_DEADZONE) return 32767;
+    return (uint16_t)(v * 257);      // 0..255 -> 0..65535, 0xFF -> 0xFFFF exactly
+}
+
+static void pad_apply(const uint8_t *r, uint16_t len) {
+    if (len < 7 || r[0] != 0x01) return;
+
+    // Port 0 (RIGHT CoCo stick) from the left stick, then let the D-pad override.
+    uint16_t x0 = pad_axis(r[1]), y0 = pad_axis(r[2]);
+    uint8_t hat = (uint8_t)(r[5] & 0x0F);
+    if (hat < 8) {                    // 8..0x0F all mean "not pressed"
+        // 0=N 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW
+        static const int8_t HX[8] = {  0, +1, +1, +1,  0, -1, -1, -1 };
+        static const int8_t HY[8] = { -1, -1,  0, +1, +1, +1,  0, -1 };
+        if (HX[hat]) x0 = HX[hat] > 0 ? 65535 : 0;
+        if (HY[hat]) y0 = HY[hat] > 0 ? 65535 : 0;
+    }
+    coco_machine_set_joystick_axis(0, 0, x0);
+    coco_machine_set_joystick_axis(0, 1, y0);
+
+    // Port 1 (LEFT CoCo stick) from the right stick.
+    coco_machine_set_joystick_axis(1, 0, pad_axis(r[3]));
+    coco_machine_set_joystick_axis(1, 1, pad_axis(r[4]));
+
+    // Fire. Cross is the primary right-hand fire; circle mirrors it so either
+    // thumb position works. Square drives the left joystick's button.
+    bool cross = (r[5] & 0x20) != 0, circle = (r[5] & 0x40) != 0;
+    bool square = (r[5] & 0x10) != 0;
+    coco_machine_set_joystick_fire(0, cross || circle || (r[6] & 0x02));  // + R1
+    coco_machine_set_joystick_fire(1, square || (r[6] & 0x01));           // + L1
+}
+
 extern "C" void tuh_hid_mount_cb(uint8_t daddr, uint8_t idx,
                                  uint8_t const *desc, uint16_t len) {
     (void)desc; (void)len;
+#if COCO_JOY_PROBE
+    uint16_t vid = 0, pid = 0;
+    tuh_vid_pid_get(daddr, &vid, &pid);
+    Serial.printf("[HID] mount daddr=%u idx=%u VID=%04X PID=%04X proto=%u descLen=%u\n",
+                  daddr, idx, vid, pid, tuh_hid_interface_protocol(daddr, idx), len);
+    Serial.flush();
+#else
+    uint16_t vid = 0, pid = 0;
+    tuh_vid_pid_get(daddr, &vid, &pid);
+#endif
+    // Bind the first DS4-identity interface we see as THE pad. Matching on
+    // VID/PID rather than "any non-keyboard interface" matters because the
+    // keyboard itself presents two extra non-keyboard interfaces (measured:
+    // 3434:0430 idx 1 and 2), which would otherwise be decoded as gamepad
+    // reports and jam the joystick.
+    if (!g_pad_daddr && vid == DS4_VID && pid == DS4_PID) {
+        g_pad_daddr = daddr; g_pad_idx = idx;
+    }
     tuh_hid_receive_report(daddr, idx);
 }
 extern "C" void tuh_hid_umount_cb(uint8_t daddr, uint8_t idx) {
-    (void)daddr; (void)idx;
     coco_machine_release_all_keys();     // drop stuck keys if the keyboard leaves
     memset(g_prev_codes, 0, sizeof(g_prev_codes));
     g_shift_prev = false;
+    // Centre the sticks and drop fire if the PAD leaves, so unplugging it does
+    // not strand the emulated joystick at full deflection.
+    if (daddr == g_pad_daddr && idx == g_pad_idx) {
+        g_pad_daddr = 0;
+        coco_machine_release_all_joysticks();
+    }
 }
 extern "C" void tuh_hid_report_received_cb(uint8_t daddr, uint8_t idx,
                                            uint8_t const *report, uint16_t len) {
     // Only the boot-keyboard interface (8-byte reports). Others (consumer/etc.)
     // are ignored but must still be re-armed.
-    if (tuh_hid_interface_protocol(daddr, idx) == HID_ITF_PROTOCOL_KEYBOARD && len >= 8)
+    uint8_t proto = tuh_hid_interface_protocol(daddr, idx);
+    if (proto == HID_ITF_PROTOCOL_KEYBOARD && len >= 8)
         hid_keyboard_apply(report);
+    else if (proto != HID_ITF_PROTOCOL_KEYBOARD && daddr == g_pad_daddr && idx == g_pad_idx)
+        pad_apply(report, len);
+#if COCO_JOY_PROBE
+    // Log non-keyboard reports, but ONLY when the bytes change. A pad streams at
+    // 100+ Hz; logging every report would swamp the link and, per CLAUDE.md,
+    // serial load is itself a variable in this repo. Change-only turns a stream
+    // into one line per physical input event, which is what we actually want to
+    // read off.
+    else if (proto != HID_ITF_PROTOCOL_KEYBOARD && len) {
+        // Only the first 12 bytes: on a DS4-style 64-byte report everything past
+        // the buttons is gyro/accel/touchpad, which changes every single report
+        // and would flood the link even with change-only logging.
+        static uint8_t  prev[24];
+        static uint16_t prev_len = 0;
+        uint16_t n = len > sizeof(prev) ? (uint16_t)sizeof(prev) : len;
+        if (n != prev_len || memcmp(prev, report, n) != 0) {
+            memcpy(prev, report, n); prev_len = n;
+            Serial.printf("[HID] rpt idx=%u len=%u:", idx, len);
+            for (uint16_t i = 0; i < n; i++) Serial.printf(" %02X", report[i]);
+            Serial.println();
+        }
+    }
+#endif
     tuh_hid_receive_report(daddr, idx);  // re-arm
 }
 

@@ -57,6 +57,7 @@ power-rail integrity a live suspect rather than anything in the firmware.
 | `COCO_VDG_T1` | 0 | Original MC6847 font + part variant. `1` = 6847T1. |
 | `COCO_NEOPIXEL` | 1 | Boot progress LEDs, left lit after boot. Costs ~15/hr desyncs (FRUITJAM-77). |
 | `COCO_DSK_WRITEBACK` | 0 | Persist disk writes to SD. Off pending FRUITJAM-88. |
+| `COCO_JOY_PROBE` | 0 | Log raw HID gamepad reports. `1` to identify a new pad (FRUITJAM-18). |
 | `COCO_CROP_BORDER` | 0 | Crop the VDG border, scale 2.5x to fill 640x480 (FRUITJAM-61). |
 | `COCO_CROP_SMOOTH` | 2 | With the above: 0 hard, 1 linear, 2 boundary blend. |
 | `NEO_IDLE_CYCLE` | 0 | Idle colour cycle. Off — desyncs video, FRUITJAM-47. |

@@ -94,10 +94,52 @@ static uint8_t g_kb_col_row_mask[8] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
 };
 
+// - - - joysticks (FRUITJAM-18) -----------------------------------------------
+// Two 2-axis analog sticks plus one fire button each, exactly as upstream models
+// them (dragon.c joystick_update / dragon_keyboard_update). Ports follow XRoar's
+// numbering, verified against xroar.c:3726 (-joy-right defaults to joy0):
+//
+//   port 0 = RIGHT joystick  -> fire on PIA0 PA0
+//   port 1 = LEFT  joystick  -> fire on PIA0 PA1
+//   axis 0 = X (0 = left, 65535 = right)
+//   axis 1 = Y (0 = up,   65535 = down)
+//
+// Axes are 16-bit because the COMPARATOR is 16-bit: upstream forms the DAC
+// threshold as ((PIA1 port A & 0xfc) | 2) << 8 and compares the raw axis against
+// it. Storing 6-bit axes and widening here would quantise the successive-
+// approximation loop against itself; keep the full range and let the ROM's own
+// binary search extract the 6 bits it wants.
+//
+// There is NO joystick.c in the vendored core (FRUITJAM-09 took a minimal
+// extraction), so this is written fresh against dragon.c, same as the sound mux.
+static uint16_t g_joy_axis[2][2] = { { 32767, 32767 }, { 32767, 32767 } };
+static uint8_t  g_joy_fire = 0;      // bit0 = port 0 (PA0), bit1 = port 1 (PA1)
+
+extern "C" void coco_machine_set_joystick_axis(int port, int axis, uint16_t value) {
+    if ((unsigned)port > 1 || (unsigned)axis > 1) return;
+    g_joy_axis[port][axis] = value;
+}
+extern "C" void coco_machine_set_joystick_fire(int port, _Bool pressed) {
+    if ((unsigned)port > 1) return;
+    if (pressed) g_joy_fire |=  (uint8_t)(1u << port);
+    else         g_joy_fire &= (uint8_t)~(1u << port);
+}
+extern "C" void coco_machine_release_all_joysticks(void) {
+    g_joy_axis[0][0] = g_joy_axis[0][1] = 32767;
+    g_joy_axis[1][0] = g_joy_axis[1][1] = 32767;
+    g_joy_fire = 0;
+}
+
 // PIA0 port-A pre-read hook: resolve the selected column(s) from port B and pull
 // down the matching row bits so the CPU sees pressed keys. With all keys
-// released this always returns $FF, which is exactly what keeps Color BASIC
-// idling in its keyboard-scan loop — the FRUITJAM-22 headless boot condition.
+// released and no fire button held this always returns $FF, which is exactly
+// what keeps Color BASIC idling in its keyboard-scan loop — the FRUITJAM-22
+// headless boot condition.
+//
+// Upstream splits this into pia0a_data_preread -> dragon_keyboard_update() +
+// joystick_update(); both write the same in_sink, so they are merged here into
+// the one hook this port already had. Order matters: the keyboard/fire rows land
+// in bits 0-6 and the comparator owns bit 7, so they do not collide.
 extern "C" void HOT_FUNC(coco_pia0_preread_a)(void *sptr) {
     (void)sptr;
     if (!g_m.pia0) return;
@@ -105,6 +147,20 @@ extern "C" void HOT_FUNC(coco_pia0_preread_a)(void *sptr) {
     uint8_t rows = 0xFF;
     for (int c = 0; c < 8; c++) {
         if (!(col_sel & (1u << c))) rows &= g_kb_col_row_mask[c];
+    }
+    // Fire buttons ride the keyboard matrix on PA0/PA1 and are read regardless
+    // of which column is strobed (upstream: row_sink &= ~(buttons & 3)).
+    rows &= (uint8_t)~(g_joy_fire & 3);
+
+    // Analog comparator on PA7. PIA0 CB2 selects the PORT and CA2 the AXIS —
+    // they are two independent selects, NOT a combined 2-bit code (the sound mux
+    // above does combine them, which is a different decode of the same pins).
+    if (g_m.pia1) {
+        unsigned port = PIA_VALUE_CB2(g_m.pia0) ? 1u : 0u;
+        unsigned axis = PIA_VALUE_CA2(g_m.pia0) ? 1u : 0u;
+        unsigned dac  = (unsigned)(((g_m.pia1->a.out_sink & 0xFC) | 2) << 8);
+        if ((unsigned)g_joy_axis[port][axis] >= dac) rows |= 0x80;
+        else                                        rows &= 0x7F;
     }
     g_m.pia0->a.in_sink = rows;
 }

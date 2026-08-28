@@ -62,7 +62,7 @@ against the schematic: **card-detect is GPIO33** (GPIO34 is SD_SCK), and the oth
 | Disk **write-back** to SD | 🚧 gated off | mechanism verified, `COCO_DSK_WRITEBACK=0` pending FRUITJAM-88 |
 | Performance | ✅ locked | ~1.33× real-time idle (12.6 ms/field); steady 59–60 fps |
 | HSTX link stability | ✅ usable | ~7.6 desyncs/hr over 25 h, each a brief recovering flicker; onset open (FRUITJAM-58) |
-| USB joystick / gamepad | ⬜ planned | **next up** (FRUITJAM-18) |
+| USB joystick / gamepad | ✅ working | DualShock-4-mode pad → both CoCo ports; sticks, D-pad, fire (FRUITJAM-18) |
 | Multi-drive (drives 1–3) | ⬜ planned | picker manages drive 0 only (FRUITJAM-78) |
 | ESP32-C6 co-processor | ⬜ planned | networked disk images, remote console, OTA (FRUITJAM-90) |
 | CoCo 3 (GIME) | ⬜ research | needs ~2× CPU throughput for fast mode; analysis in FRUITJAM-84 |
