@@ -725,7 +725,7 @@ static void eject_drive(int drive, bool remember) {
     g_dskw_n[drive] = 0; g_dskw_overflow[drive] = false;
     coco_machine_mount_dsk_drive(drive, nullptr, 0);
     if (remember) save_dsk_assignments(g_dsk_names, g_dsk_cur, COCO_NDRIVE);
-    snprintf(g_pick_msg, sizeof(g_pick_msg), "DR%d EMPTY", drive);
+    snprintf(g_pick_msg, sizeof(g_pick_msg), "DRIVE %d EMPTY", drive);
 }
 
 // Row to sit on when the overlay opens: whatever is in drive 0, else the top.
@@ -751,7 +751,9 @@ static bool mount_dsk_index(int i, int drive, bool remember) {
     g_dsk_cur[drive] = i;
     coco_machine_mount_dsk_drive(drive, g_dsk_img[drive], len);
     if (remember) save_dsk_assignments(g_dsk_names, g_dsk_cur, COCO_NDRIVE);
-    snprintf(g_pick_msg, sizeof(g_pick_msg), "DR%d = %s", drive, g_dsk_names[i]);
+    // " IN DRIVE d" is 11 of the panel's 32 columns, so the name gets 21 —
+    // long names are truncated here rather than running off the row.
+    snprintf(g_pick_msg, sizeof(g_pick_msg), "%.21s IN DRIVE %d", g_dsk_names[i], drive);
     return true;
 }
 
@@ -949,7 +951,7 @@ static void draw_picker(void) {
     const uint16_t hi  = g_pal[8];    // black      — text on the selected row
     const uint16_t bg  = g_pal[9];    // dark green — panel background
     const int      COLS = OVL_COLS;             // 32, the CoCo text width
-    const int      rows_visible = 13;   // rows 2-14; 0 = title, 1 = spacer, 15 = status
+    const int      rows_visible = 14;   // rows 1-14; 0 = title, 15 = status
 
     char line[OVL_COLS + 1];
     for (int i = 0; i < COLS; i++) line[i] = ' ';
@@ -1009,10 +1011,19 @@ static void draw_picker(void) {
         }
         // Selected row: black on green, and the line is padded to the full 32
         // columns above so the highlight reads as a solid bar.
-        fb_text(0, 2 + r, line, (i == g_pick_sel) ? hi : fg, (i == g_pick_sel) ? fg : bg);
+        fb_text(0, 1 + r, line, (i == g_pick_sel) ? hi : fg, (i == g_pick_sel) ? fg : bg);
     }
-    if (g_dsk_count == 0) fb_text(0, 2, "NO .DSK FILES IN /COCO/DSK", fg, bg);
-    if (g_pick_msg[0])    fb_text(0, 2 + rows_visible, g_pick_msg, fg, bg);
+    if (g_dsk_count == 0) fb_text(0, 1, "NO .DSK FILES IN /COCO/DSK", fg, bg);
+
+    // Status bar, same treatment as the title: green on black, padded to the
+    // full width, and drawn ALWAYS rather than only when there is a message —
+    // so the panel keeps a bar top and bottom instead of the list appearing to
+    // change height as one comes and goes.
+    char sts[OVL_COLS + 1];
+    snprintf(sts, sizeof(sts), " %s", g_pick_msg);
+    for (size_t k = strlen(sts); k < (size_t)COLS; k++) sts[k] = ' ';
+    sts[COLS] = '\0';
+    fb_text(0, 1 + rows_visible, sts, fg, hi);
 }
 
 // Poll the buttons and drive the picker. Called once per field from loop().
