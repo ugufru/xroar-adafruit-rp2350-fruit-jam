@@ -29,6 +29,19 @@ power-rail integrity a live suspect rather than anything in the firmware.
 
 - **A clean serial log means "transmitting", never "displaying."** The firmware, pico_hdmi's own
   counters and the framebuffer have all read perfect while the screen was black.
+- **Confirm the instrument is in the flashed binary before believing its silence (FRUITJAM-92).**
+  One level down from the rule above: a clean log can mean *the probe was never there*. Both traps
+  have bitten — `PLATFORMIO_BUILD_FLAGS` set on `pio run` but **not** on `pio run -t upload`, so the
+  upload rebuilt at the default and flashed probe-less firmware three times; and instrumentation
+  written as an `else if` in a dispatch chain the target device never reached. Both produced zero
+  output, which was then misread as hardware behaviour and misattributed twice. Check with
+  `strings .pio/build/coco/firmware.elf | grep '<probe string>'` — cheap, and it settles it.
+- **Change-only logging cannot measure a steady state (FRUITJAM-92).** A probe that prints only on
+  change renders "no drift" and "device unplugged" identical — both are zero lines — and never shows
+  the resting value. For at-rest or baseline questions, sample unconditionally on an interval. Make
+  min/max **per-interval**, not cumulative: cumulative latched the extremes from a USB
+  re-enumeration transient and then read full-scale forever, which looks exactly like a catastrophic
+  fault and is not.
 - **Short captures cannot see episodic faults.** Desyncs arrive in bursts; episode onset has ranged
   from 6 s to 4 min after boot. A 15 s capture proves nothing; a 3 min capture proves little.
 - **Use `scripts/serial_logger.py`** (wall-clock timestamps, survives reboots) and compare
