@@ -47,6 +47,17 @@ extern "C" {
 // until it has been measured against the default path — it costs core-0 blit
 // time, and core-0 headroom is the variable that correlates with HSTX desync
 // rate (FRUITJAM-58). See the g_scan declaration for the full rationale.
+// FRUITJAM-88: SD write-back is OFF by default until the in-memory disk image
+// is trustworthy. SAVEM corrupts the image (a pre-existing FDC multi-sector
+// write bug), and write-back faithfully persists that corruption to the card —
+// turning a fault that a reboot used to clear into permanent damage to the
+// .dsk. The mechanism itself is verified working (FRUITJAM-81: SAVE survives a
+// power cycle), so it is gated rather than removed. Set to 1 once FRUITJAM-88
+// is fixed.
+#ifndef COCO_DSK_WRITEBACK
+#define COCO_DSK_WRITEBACK 0
+#endif
+
 #ifndef COCO_CROP_BORDER
 #define COCO_CROP_BORDER 0
 #endif
@@ -581,6 +592,21 @@ static bool load_last_dsk(char *out, size_t n) {
 // survive disk swaps, SD removal and the picker, and FatFs offers no way to
 // validate one cheaply. Opening costs a directory lookup; a save is rare.
 static void flush_dsk_writes(bool all) {
+#if !COCO_DSK_WRITEBACK
+    // Gated off (FRUITJAM-88). Keep draining the queue so the FDC-side path and
+    // its dedup still run exactly as they will when this is re-enabled — only
+    // the card write is suppressed. Writes still land in the PSRAM image, so
+    // SAVE/LOAD work within a session and are simply lost on power-down, which
+    // is the behaviour before FRUITJAM-81.
+    (void)all;
+    if (g_dskw_n || g_dskw_overflow) {
+        if (Serial && Serial.availableForWrite() >= 64)
+            Serial.printf("  [dsk: %d sector(s) NOT written back - COCO_DSK_WRITEBACK=0]\n",
+                          g_dskw_overflow ? -1 : g_dskw_n);
+        g_dskw_n = 0; g_dskw_overflow = false;
+    }
+    return;
+#else
     if ((!g_dskw_n && !g_dskw_overflow) || !g_dsk_path[0] || !g_dsk_img) return;
     FIL f;
     if (f_open(&f, g_dsk_path, FA_WRITE) != FR_OK) {
@@ -611,6 +637,7 @@ static void flush_dsk_writes(bool all) {
     g_dskw_overflow = false;
     if (Serial && Serial.availableForWrite() >= 48)
         Serial.printf("[dsk: wrote %s]\n", wrote < 0 ? "FULL IMAGE" : "sectors");
+#endif
 }
 
 // Load image i into PSRAM and hand it to the FDC, freeing the previous one.
