@@ -1310,7 +1310,12 @@ static void hid_keyboard_apply(const uint8_t *report) {
 // touches a gamepad — it stays in report mode, and reads back as protocol NONE.
 // That makes "protocol == NONE" the gamepad discriminator here.
 // Raw-report logging. Default OFF: it is a bring-up aid, and per CLAUDE.md
-// serial load is itself a variable in this repo. Set to 1 to identify a new pad.
+// serial load is itself a variable in this repo.
+//   1 = log raw reports on CHANGE — identifies a new pad's byte layout.
+//   2 = per-axis min/max/current once a second — AT-REST calibration.
+// Mode 2 exists because mode 1 cannot measure a stationary stick: a still axis
+// emits no changes, so "no drift" and "pad unplugged" produce identical output
+// (zero lines), and the resting VALUE is never shown at all. FRUITJAM-92.
 #ifndef COCO_JOY_PROBE
 #define COCO_JOY_PROBE 0
 #endif
@@ -1344,12 +1349,20 @@ static void hid_keyboard_apply(const uint8_t *report) {
 static uint8_t g_pad_daddr = 0;      // 0 = no pad bound
 static uint8_t g_pad_idx   = 0;
 
-// The sticks on this pad rest a long way off centre and jitter (measured: LX
-// wandering across most of its range while untouched). A raw pass-through would
-// leave the emulated stick permanently deflected, so anything within DEADZONE of
-// centre is forced to exact centre. 0x18 of 0x80 is wide enough to swallow the
-// observed drift without eating real travel.
-#define PAD_DEADZONE 0x18
+// Deadzone. MEASURED at rest, FRUITJAM-92: 105 one-second windows with the pad
+// untouched on the desk, tracking per-window min/max of all four axes. 86 of
+// them read exactly 80-80 on every axis — zero LSBs of jitter — and the 19 that
+// moved were one contiguous 23-second burst of the pad being handled, with a
+// clean unbroken 58 seconds after it. Centre is exactly 0x80 on all four axes,
+// so there is no per-axis offset to calibrate either.
+//
+// This pad therefore needs NO drift compensation, and the 0x18 first guess was
+// discarding 19% of half-travel for nothing. Kept small but non-zero for two
+// reasons: insurance against unit variation and wear, and — the concrete one —
+// it snaps rest to EXACT centre, which the scaling below cannot do on its own.
+// 8-bit 0..255 has no exact midpoint, so 0x80 * 257 = 32896 rather than 32767;
+// without a deadzone the emulated stick would sit ~129/65535 off centre forever.
+#define PAD_DEADZONE 0x06
 
 static inline uint16_t pad_axis(uint8_t v) {
     int d = (int)v - 0x80;
@@ -1428,7 +1441,37 @@ extern "C" void tuh_hid_report_received_cb(uint8_t daddr, uint8_t idx,
         hid_keyboard_apply(report);
     else if (proto != HID_ITF_PROTOCOL_KEYBOARD && daddr == g_pad_daddr && idx == g_pad_idx)
         pad_apply(report, len);
-#if COCO_JOY_PROBE
+#if COCO_JOY_PROBE >= 2
+    // At-rest calibration: running min/max per axis, reported once a second.
+    // Unconditional (not change-gated) so a motionless stick still produces
+    // output, and so absence of output means "no reports", unambiguously.
+    // NOTE this is a STANDALONE if, deliberately not part of the dispatch chain
+    // above: the bound pad is consumed by the pad_apply branch, so an else-if
+    // here would only ever see devices that are NOT the pad — i.e. never fire.
+    if (proto != HID_ITF_PROTOCOL_KEYBOARD && len >= 5 && report[0] == 0x01) {
+        static uint8_t  mn[4] = { 255, 255, 255, 255 };
+        static uint8_t  mx[4] = { 0, 0, 0, 0 };
+        static uint32_t last = 0, n = 0;
+        for (int i = 0; i < 4; i++) {
+            uint8_t v = report[1 + i];
+            if (v < mn[i]) mn[i] = v;
+            if (v > mx[i]) mx[i] = v;
+        }
+        n++;
+        if (millis() - last >= 1000) {
+            last = millis();
+            Serial.printf("[JOY] n=%lu cur %02X %02X %02X %02X | LX %02X-%02X LY %02X-%02X "
+                          "RX %02X-%02X RY %02X-%02X\n", (unsigned long)n,
+                          report[1], report[2], report[3], report[4],
+                          mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], mn[3], mx[3]);
+            // Min/max are PER-INTERVAL, reset after each print. Cumulative-since-
+            // boot was useless here: it latched the extremes thrown by the pad's
+            // Switch->DS4 re-enumeration and then reported 00-FF forever, which
+            // looks exactly like catastrophic drift and is not.
+            for (int i = 0; i < 4; i++) { mn[i] = 255; mx[i] = 0; }
+        }
+    }
+#elif COCO_JOY_PROBE
     // Log non-keyboard reports, but ONLY when the bytes change. A pad streams at
     // 100+ Hz; logging every report would swamp the link and, per CLAUDE.md,
     // serial load is itself a variable in this repo. Change-only turns a stream
