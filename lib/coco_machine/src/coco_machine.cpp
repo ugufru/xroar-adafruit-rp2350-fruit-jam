@@ -436,10 +436,21 @@ static inline long dsk_offset(int track, int side, int sector) {
     return off;
 }
 
+// FRUITJAM-81: told about every sector the FDC writes, so the host layer can
+// persist it. Reports the OFFSET only - the data is already in the image the
+// host owns, so there is nothing to copy and nothing to keep in sync.
+static coco_dsk_write_cb_t g_dsk_write_cb = NULL;
+extern "C" void coco_machine_set_dsk_write_callback(coco_dsk_write_cb_t cb) { g_dsk_write_cb = cb; }
+
 static void fdc_finish(void) {
     if (g_fdc_writing && g_dsk && !g_dsk_wp) {
         long off = dsk_offset(g_fdc_track, g_fdc_side, g_fdc_sector);
-        if (off >= 0) memcpy(g_dsk + off, g_fdc_buf, g_dsk_secsz);
+        if (off >= 0) {
+            memcpy(g_dsk + off, g_fdc_buf, g_dsk_secsz);
+            // Report, do not write. SD I/O here would block mid-instruction;
+            // the host defers it to a field boundary (see flush_dsk_writes).
+            if (g_dsk_write_cb) g_dsk_write_cb((uint32_t)off, g_dsk_secsz);
+        }
     }
     g_fdc_status = g_fdc_type1 ? (uint8_t)((g_fdc_track == 0) ? ST_TRK0 : 0)
                               : (uint8_t)(g_fdc_status & ~(ST_BUSY | ST_DRQ));

@@ -115,6 +115,14 @@ void coco_machine_load_cart(const uint8_t *rom, size_t len);
 // 256-byte, sector base 1). Pass NULL/0 to unmount.
 void coco_machine_mount_dsk(uint8_t *buf, size_t len);
 
+// FRUITJAM-81: called after the FDC writes a sector into the mounted image,
+// with that sector's byte offset and length. The data is already in the buffer
+// the caller passed to coco_machine_mount_dsk(), so nothing is copied. Do NOT
+// perform I/O from this callback - it runs mid-instruction, with the emulated
+// CPU halted waiting on the FDC. Record and defer.
+typedef void (*coco_dsk_write_cb_t)(uint32_t offset, uint32_t len);
+void coco_machine_set_dsk_write_callback(coco_dsk_write_cb_t cb);
+
 // - - - cassette (.cas) playback (FRUITJAM-28) --------------------------------
 // Load a .cas tape image (caller-owned buffer, must outlive playback) and let
 // the CoCo read it with CLOAD / CLOADM. Playback is event-driven and auto-gated

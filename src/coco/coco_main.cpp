@@ -461,6 +461,31 @@ static int      g_pick_sel  = 0;
 static bool     g_pick_open = false;
 static uint8_t *g_dsk_img   = nullptr; // PSRAM image backing the mounted disk
 static size_t   g_dsk_len   = 0;       // its length — needed to find the directory
+
+// FRUITJAM-81: write-back. The FDC reports each sector it writes; we record the
+// offset and flush at a FIELD BOUNDARY, never from inside the emulation call.
+//
+// Offsets only — the data is already in g_dsk_img, so there is nothing to copy
+// and nothing that can go stale. A sector written twice before a flush is
+// deduplicated, so a program rewriting one sector in a loop costs one card
+// write, not thousands.
+//
+// The queue is small on purpose. RSDOS writes a handful of sectors per SAVE (the
+// data granules plus the directory and FAT), so 16 covers a normal save with
+// room to spare; overflow degrades to a FULL-IMAGE flush rather than silently
+// losing data.
+#define DSKW_MAX 16
+static char     g_dsk_path[48] = "";      // path of the mounted image, for write-back
+static uint32_t g_dskw_off[DSKW_MAX];
+static int      g_dskw_n = 0;
+static bool     g_dskw_overflow = false;
+
+static void dsk_sector_written(uint32_t off, uint32_t len) {
+    (void)len;
+    for (int i = 0; i < g_dskw_n; i++) if (g_dskw_off[i] == off) return;   // dedup
+    if (g_dskw_n >= DSKW_MAX) { g_dskw_overflow = true; return; }
+    g_dskw_off[g_dskw_n++] = off;
+}
 static char     g_pick_msg[40] = "";
 static bool     g_pick_dirty = false;   // redraw the overlay only when it changes
 
@@ -543,6 +568,51 @@ static bool load_last_dsk(char *out, size_t n) {
     return br > 0;
 }
 
+// Write back the sectors the FDC has touched. Called from loop() at a field
+// boundary, and with all=true before a disk swap.
+//
+// Why this is affordable: during a disk operation the emulated CPU is HALTED
+// waiting on the FDC, and real CoCo software already parks its UI while the
+// drive spins. The card write lands inside latency the software expects — the
+// goal is to be faster and quieter than a real drive, not to pretend the drive
+// is instant.
+//
+// One f_open per flush rather than a held handle: a held FIL would have to
+// survive disk swaps, SD removal and the picker, and FatFs offers no way to
+// validate one cheaply. Opening costs a directory lookup; a save is rare.
+static void flush_dsk_writes(bool all) {
+    if ((!g_dskw_n && !g_dskw_overflow) || !g_dsk_path[0] || !g_dsk_img) return;
+    FIL f;
+    if (f_open(&f, g_dsk_path, FA_WRITE) != FR_OK) {
+        if (Serial && Serial.availableForWrite() >= 48)
+            Serial.println("[dsk: write-back open failed]");
+        g_dskw_n = 0; g_dskw_overflow = false;      // do not spin on a dead card
+        return;
+    }
+    UINT bw = 0;
+    int wrote = 0;
+    if (g_dskw_overflow) {
+        // Lost track of which sectors changed — rewrite the whole image rather
+        // than persist a partial, inconsistent picture.
+        f_lseek(&f, 0);
+        f_write(&f, g_dsk_img, (UINT)g_dsk_len, &bw);
+        wrote = -1;
+    } else {
+        int n = all ? g_dskw_n : (g_dskw_n > 4 ? 4 : g_dskw_n);   // bound per field
+        for (int i = 0; i < n; i++) {
+            f_lseek(&f, g_dskw_off[i]);
+            f_write(&f, g_dsk_img + g_dskw_off[i], 256, &bw);
+        }
+        wrote = n;
+        for (int i = n; i < g_dskw_n; i++) g_dskw_off[i - n] = g_dskw_off[i];
+        g_dskw_n -= n;
+    }
+    f_close(&f);
+    g_dskw_overflow = false;
+    if (Serial && Serial.availableForWrite() >= 48)
+        Serial.printf("[dsk: wrote %s]\n", wrote < 0 ? "FULL IMAGE" : "sectors");
+}
+
 // Load image i into PSRAM and hand it to the FDC, freeing the previous one.
 // Blocks core 0 for the length of the SD read (~160 KB) — see FRUITJAM-50.
 // remember=true persists the choice (FRUITJAM-71); boot passes false, because
@@ -558,6 +628,9 @@ static bool mount_dsk_index(int i, bool remember) {
     if (g_dsk_img) __psram_free(g_dsk_img);
     g_dsk_img = (uint8_t *)img;
     g_dsk_len = len;
+    // A swap abandons any unflushed sectors for the OLD image, so flush first.
+    flush_dsk_writes(true);
+    snprintf(g_dsk_path, sizeof(g_dsk_path), "%s", path);
     g_dsk_cur = i;
     coco_machine_mount_dsk(g_dsk_img, len);
     if (remember) save_last_dsk(g_dsk_names[i]);
@@ -1366,6 +1439,7 @@ void setup() {
 
     Serial.printf("[%lu ms] ", millis()); Serial.print("STAGE machine init... "); Serial.flush(); delay(20);
     if (!coco_machine_init(g_rom, got)) { Serial.println("FATAL: machine init"); while (1) delay(500); }
+    coco_machine_set_dsk_write_callback(dsk_sector_written);   // FRUITJAM-81
     // Optional cassette: drop a .cas at 0:/coco/tapes/AUTO.CAS, then CLOAD in BASIC.
     {
         size_t cas = load_cas("0:/coco/tapes/AUTO.CAS");
@@ -1586,6 +1660,7 @@ void RAM_FUNC loop() {
     }
 
     picker_task();          // FRUITJAM-50: board buttons -> disk picker
+    if (!g_pick_open) flush_dsk_writes(false);   // FRUITJAM-81: bounded write-back
 
     // FRUITJAM-72: after a button-2 cold boot, wait for a settled OK prompt then
     // type the disk's first program. Gated on the emulator actually running -
