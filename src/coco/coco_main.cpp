@@ -574,6 +574,30 @@ static void scan_dsk_dir(void) {
     if (g_dsk_count == PICKER_MAX)
         Serial.printf("[picker: hit PICKER_MAX=%d, further .dsk ignored] ", PICKER_MAX);
     f_closedir(&d);
+
+    // Sort case-insensitively: f_readdir returns FAT DIRECTORY ORDER, which is
+    // insertion order and effectively arbitrary to a reader — a card written
+    // over months lists in the order files happened to be copied.
+    //
+    // Safe to reorder here because g_dsk_cur[] indices are assigned AFTER this
+    // runs, and the saved assignments resolve by NAME rather than index (the
+    // same reasoning FRUITJAM-71 used for storing a filename, not an index).
+    // scan_dsk_dir() is called once, at boot; if it ever gains a rescan caller
+    // it must re-resolve g_dsk_cur[] by name, since sorting would otherwise
+    // leave those indices pointing at the wrong disks.
+    //
+    // Insertion sort: PICKER_MAX is 128, this runs once at boot, and it costs
+    // no scratch buffer beyond one row.
+    for (int i = 1; i < g_dsk_count; i++) {
+        char key[DSK_NAME_MAX];
+        memcpy(key, g_dsk_names[i], DSK_NAME_MAX);
+        int j = i - 1;
+        while (j >= 0 && strcasecmp(g_dsk_names[j], key) > 0) {
+            memcpy(g_dsk_names[j + 1], g_dsk_names[j], DSK_NAME_MAX);
+            j--;
+        }
+        memcpy(g_dsk_names[j + 1], key, DSK_NAME_MAX);
+    }
 }
 
 // FRUITJAM-71: remember the last disk the USER mounted, so a reboot comes back
