@@ -42,6 +42,17 @@ power-rail integrity a live suspect rather than anything in the firmware.
   min/max **per-interval**, not cumulative: cumulative latched the extremes from a USB
   re-enumeration transient and then read full-scale forever, which looks exactly like a catastrophic
   fault and is not.
+- **Localise before you treat (FRUITJAM-97).** Three targeted fixes were tried against the
+  disk-mount video dropout — QMI read pacing, a forced resync, DMA channel priority — and all
+  three failed, because none of them had established *which subsystem* was at fault. Bisecting
+  the mount into its two halves and running them separately (PSRAM writes alone / SD reads
+  alone) settled it in one flash cycle: SD reads dropped the link, PSRAM writes never did, and
+  the timings showed why — 151 ms of SD against 15 ms of PSRAM, so every earlier fix had been
+  aimed at the negligible half. The root cause was the SD clock's GPIO drive strength, an
+  **electrical** variable no bus-level fix could ever have reached.
+- **Confirm a fix by reversal, not by one good arm.** The same issue: 12 mA drops, 4 mA does
+  not, 12 mA drops again. Given how episodic this repo's faults are, a single quiet run proves
+  nothing — put the old value back and check the fault returns.
 - **Short captures cannot see episodic faults.** Desyncs arrive in bursts; episode onset has ranged
   from 6 s to 4 min after boot. A 15 s capture proves nothing; a 3 min capture proves little.
 - **Use `scripts/serial_logger.py`** (wall-clock timestamps, survives reboots) and compare
@@ -71,6 +82,8 @@ power-rail integrity a live suspect rather than anything in the firmware.
 | `COCO_NEOPIXEL` | 1 | Boot progress LEDs, left lit after boot. Costs ~15/hr desyncs (FRUITJAM-77). |
 | `COCO_DSK_WRITEBACK` | 0 | Persist disk writes to SD. Off pending FRUITJAM-88. |
 | `COCO_JOY_PROBE` | 0 | Log raw HID gamepad reports. `1` to identify a new pad (FRUITJAM-18). |
+| `COCO_MOUNT_PROBE` | 0 | Log a disk mount's duration and both resync counters (FRUITJAM-97). |
+| `COCO_MOUNT_BISECT` | 0 | Alternate PSRAM-write-only / SD-read-only every 5 s, to isolate which half of a mount disturbs the video (FRUITJAM-97). |
 | `COCO_CROP_BORDER` | 0 | Crop the VDG border, scale 2.5x to fill 640x480 (FRUITJAM-61). |
 | `COCO_CROP_SMOOTH` | 2 | With the above: 0 hard, 1 linear, 2 boundary blend. |
 | `NEO_IDLE_CYCLE` | 0 | Idle colour cycle. Off — desyncs video, FRUITJAM-47. |

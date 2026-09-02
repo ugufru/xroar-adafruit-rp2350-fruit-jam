@@ -2115,6 +2115,69 @@ void setup() {
 // report block. The report runs once a second, so it evicts cache lines rarely.
 
 
+// FRUITJAM-97 BISECT. A mount does two very different things at once: it streams
+// ~160 KB off the SD card over SPI, and it writes those bytes into PSRAM across
+// the QMI. Every fix aimed at the bus has failed, so rather than guess again,
+// run the two halves SEPARATELY and see which one drops the picture.
+//
+//   phase A - PSRAM writes only, no SD at all (memset a PSRAM buffer)
+//   phase B - SD reads only, no PSRAM at all (read into a small SRAM scratch)
+//
+// Same byte count, same duration, one subsystem each. The user watches the screen
+// and reports which marker coincides with a drop; the log cannot answer this,
+// because the watchdog is blind to the silent mode (two of three mounts dropped
+// the screen with the resync counters unmoved).
+#ifndef COCO_MOUNT_BISECT
+#define COCO_MOUNT_BISECT 0
+#endif
+#if COCO_MOUNT_BISECT
+static void mount_bisect_task(void) {
+    static uint32_t next_ms = 0;
+    static int      phase   = 0;
+    static uint8_t *pbuf    = nullptr;
+    const size_t    SZ      = 161280;          // one standard 35-track image
+    uint32_t now = millis();
+    if (now < 8000) return;                    // let boot settle
+    if (next_ms && now < next_ms) return;
+    next_ms = now + 5000;
+
+    if (!pbuf) pbuf = (uint8_t *)__psram_malloc(SZ);
+    if (!pbuf) { Serial.println("[bisect] PSRAM alloc failed"); return; }
+
+    if (phase == 0) {
+        Serial.printf("[bisect] A: PSRAM write %u B, no SD\n", (unsigned)SZ);
+        Serial.flush();
+        uint32_t t = millis();
+        // Chunked exactly like load_psram_file, so the write pattern matches.
+        for (size_t off = 0; off < SZ; off += PSRAM_READ_CHUNK)
+            memset(pbuf + off, (int)(off & 0xFF),
+                   (SZ - off > PSRAM_READ_CHUNK) ? PSRAM_READ_CHUNK : (SZ - off));
+        Serial.printf("[bisect] A done in %lu ms\n", (unsigned long)(millis() - t));
+    } else {
+        Serial.printf("[bisect] B: SD read %u B -> SRAM, no PSRAM\n", (unsigned)SZ);
+        Serial.flush();
+        uint32_t t = millis();
+        static uint8_t scratch[PSRAM_READ_CHUNK];
+        FIL f;
+        if (f_open(&f, g_dsk_path[0][0] ? g_dsk_path[0] : "0:/coco/dsk/AUTO.DSK", FA_READ) == FR_OK) {
+            UINT br = 0; size_t total = 0;
+            while (total < SZ) {
+                if (f_read(&f, scratch, PSRAM_READ_CHUNK, &br) != FR_OK || br == 0) {
+                    f_lseek(&f, 0);            // wrap so byte count matches phase A
+                    continue;
+                }
+                total += br;
+            }
+            f_close(&f);
+            Serial.printf("[bisect] B done in %lu ms\n", (unsigned long)(millis() - t));
+        } else {
+            Serial.println("[bisect] B: no image to read");
+        }
+    }
+    phase ^= 1;
+}
+#endif
+
 void RAM_FUNC loop() {
     static uint32_t deadline = 0;
     static uint32_t frames = 0, last_report = 0, run_us_acc = 0, blit_us_acc = 0;
@@ -2194,6 +2257,9 @@ void RAM_FUNC loop() {
     if (g_pick_open) {
         if (g_pick_dirty) { draw_picker(); g_pick_dirty = false; }
     } else {
+#if COCO_MOUNT_BISECT
+        mount_bisect_task();
+#endif
         coco_machine_run_cycles(CYCLES_PER_FRAME);
         coco_machine_render_frame();
         // FRUITJAM-61: time the blit separately from the rest of the field. It

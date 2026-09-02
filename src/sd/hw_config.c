@@ -26,7 +26,22 @@ static spi_t g_sd_spi = {
     .sck_gpio   = 34,
     .set_drive_strength       = true,
     .mosi_gpio_drive_strength = GPIO_DRIVE_STRENGTH_2MA,
-    .sck_gpio_drive_strength  = GPIO_DRIVE_STRENGTH_12MA,
+    // FRUITJAM-97: 4 mA, NOT the 12 mA this started at. The SD clock switches at
+    // 12.5 MHz for ~151 ms during an image load, and at 12 mA that read reliably
+    // dropped the HSTX link — the picture cut out for 1-2 s on every disk mount.
+    //
+    // CONFIRMED BY A/B/A on hardware: 12 mA drops, 4 mA does not, 12 mA drops
+    // again immediately. Reads still complete in the same 151 ms at 4 mA, so the
+    // card is comfortable and the change costs nothing.
+    //
+    // The fault is SUPPLY NOISE, not bus contention. 12 mA was the same drive as
+    // the HSTX pins themselves and 6x everything else on this bus, making the SD
+    // clock the loudest aggressor on the board for the duration of a read. This
+    // is the first hard confirmation of the "rate tracks board current" lead in
+    // FRUITJAM-58 (see also FRUITJAM-77: a lit LED strip alone costs 3.5x).
+    //
+    // Do not raise this without re-running the A/B/A.
+    .sck_gpio_drive_strength  = GPIO_DRIVE_STRENGTH_4MA,
     .baud_rate  = 12500000,   // ~12.5 MHz — conservative first bring-up (pizero-proven)
 };
 
