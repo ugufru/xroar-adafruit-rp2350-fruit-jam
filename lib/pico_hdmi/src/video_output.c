@@ -871,32 +871,15 @@ void video_output_core1_run(void)
     }
 
     // DMA Setup
-    //
-    // FRUITJAM-102 (local modification, see PROVENANCE.md): mark both scanout
-    // channels HIGH PRIORITY. The SDK default is false (dma_channel_get_default_config
-    // calls channel_config_set_high_priority(&c, false)), which left the channels
-    // feeding the TMDS FIFO arbitrating on equal footing with every other DMA
-    // master: SD on 2/3, PIO-USB TX on 4, and the I2S audio DMA.
-    //
-    // The bus_ctrl_hw->priority write further down is NOT the same thing. That
-    // prioritises DMA over the PROCESSORS at the bus arbiter; arbitration BETWEEN
-    // DMA channels is the DMA block's own scheduler, controlled per channel by
-    // CTRL.HIGH_PRIORITY. So the scanout was defended against the CPUs but not
-    // against the SD card, which is the wrong way round for this board.
-    //
-    // Starving this FIFO corrupts TMDS WITHOUT changing the frame count, so the
-    // desync watchdog cannot see it (FRUITJAM-97) — which is why it went unnoticed.
     dma_channel_config c = dma_channel_get_default_config(DMACH_PING);
     channel_config_set_chain_to(&c, DMACH_PONG);
     channel_config_set_dreq(&c, DREQ_HSTX);
-    channel_config_set_high_priority(&c, true);
     dma_channel_configure(DMACH_PING, &c, &hstx_fifo_hw->fifo, vblank_line_vsync_off, count_of(vblank_line_vsync_off),
                           false);
 
     c = dma_channel_get_default_config(DMACH_PONG);
     channel_config_set_chain_to(&c, DMACH_PING);
     channel_config_set_dreq(&c, DREQ_HSTX);
-    channel_config_set_high_priority(&c, true);
     dma_channel_configure(DMACH_PONG, &c, &hstx_fifo_hw->fifo, vblank_line_vsync_off, count_of(vblank_line_vsync_off),
                           false);
 
