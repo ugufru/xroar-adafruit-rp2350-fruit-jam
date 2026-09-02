@@ -22,6 +22,21 @@
 static spi_t g_sd_spi = {
     .hw_inst    = spi0,
     .miso_gpio  = 36,
+// FRUITJAM-97: both knobs are build-settable so measurement arms are one flag
+// each and can be flashed separately, per CLAUDE.md's rule about defining arms
+// in advance rather than segmenting one log.
+#ifndef COCO_SD_BAUD
+#define COCO_SD_BAUD 12500000
+#endif
+// 12 mA, the ORIGINAL bring-up value. It was changed to 4 mA on 2026-09-02 on the
+// strength of an eyeball A/B/A, and that was WRONG: measured with the FIFO probe
+// over ~55 trials per arm, 4 mA averages 5.54 underruns per SD read against
+// 12 mA's 2.50 — the "fix" more than DOUBLED the fault it was meant to cure.
+// Do not lower this again without a FIFO-probe measurement (FRUITJAM-97).
+#ifndef COCO_SD_SCK_DRIVE
+#define COCO_SD_SCK_DRIVE GPIO_DRIVE_STRENGTH_12MA
+#endif
+
     .mosi_gpio  = 35,
     .sck_gpio   = 34,
     .set_drive_strength       = true,
@@ -41,8 +56,8 @@ static spi_t g_sd_spi = {
     // FRUITJAM-58 (see also FRUITJAM-77: a lit LED strip alone costs 3.5x).
     //
     // Do not raise this without re-running the A/B/A.
-    .sck_gpio_drive_strength  = GPIO_DRIVE_STRENGTH_4MA,
-    .baud_rate  = 12500000,   // ~12.5 MHz — conservative first bring-up (pizero-proven)
+    .sck_gpio_drive_strength  = COCO_SD_SCK_DRIVE,
+    .baud_rate  = COCO_SD_BAUD,   // ~12.5 MHz — conservative first bring-up (pizero-proven)
 };
 
 static sd_spi_if_t spi_if = {

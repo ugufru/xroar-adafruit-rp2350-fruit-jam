@@ -2133,6 +2133,9 @@ void setup() {
 #ifndef COCO_BISECT_GAP_US
 #define COCO_BISECT_GAP_US 0
 #endif
+#if COCO_MOUNT_BISECT && PICO_HDMI_FIFO_PROBE
+static uint32_t g_bisect_trials = 0, g_bisect_underruns = 0;
+#endif
 #if COCO_MOUNT_BISECT
 static void mount_bisect_task(void) {
     // ONE PHASE PER BUILD. The four-phase cycling version was a bad experiment:
@@ -2165,6 +2168,10 @@ static void mount_bisect_task(void) {
                       bounce ? " via SRAM bounce" : " DIRECT (= real mount)");
         Serial.flush();
         uint32_t t = millis();
+#if PICO_HDMI_FIFO_PROBE
+        extern volatile uint32_t hstx_fifo_underruns;
+        uint32_t ur0 = hstx_fifo_underruns;
+#endif
         static uint8_t bbuf[PSRAM_READ_CHUNK];
         FIL f;
         if (f_open(&f, g_dsk_path[0][0] ? g_dsk_path[0] : "0:/coco/dsk/AUTO.DSK", FA_READ) == FR_OK) {
@@ -2185,8 +2192,20 @@ static void mount_bisect_task(void) {
 #endif
             }
             f_close(&f);
+#if PICO_HDMI_FIFO_PROBE
+            // Each run is a TRIAL. Totals are accumulated and reported with the
+            // per-second stats too, so a CDC dropout (which these loads cause)
+            // cannot lose the measurement — the running mean is always readable.
+            uint32_t d = hstx_fifo_underruns - ur0;
+            g_bisect_trials++;
+            g_bisect_underruns += d;
+            Serial.printf("[bisect] %s done in %lu ms, underruns +%lu\n",
+                          bounce ? "D" : "C", (unsigned long)(millis() - t),
+                          (unsigned long)d);
+#else
             Serial.printf("[bisect] %s done in %lu ms\n", bounce ? "D" : "C",
                           (unsigned long)(millis() - t));
+#endif
         } else {
             Serial.println("[bisect] no image to read");
         }
@@ -2378,6 +2397,14 @@ void RAM_FUNC loop() {
                                   (unsigned long)hstx_fifo_min_level);
                 prev_ur = ur;
                 hstx_fifo_min_level = 0xFFFFFFFF;   // per-report minimum
+#if COCO_MOUNT_BISECT
+                if (g_bisect_trials && Serial.availableForWrite() >= 64)
+                    Serial.printf("  [arm] trials %lu  underruns %lu  mean %lu.%02lu/trial\n",
+                                  (unsigned long)g_bisect_trials,
+                                  (unsigned long)g_bisect_underruns,
+                                  (unsigned long)(g_bisect_underruns / g_bisect_trials),
+                                  (unsigned long)((g_bisect_underruns * 100 / g_bisect_trials) % 100));
+#endif
             }
 #endif
         }

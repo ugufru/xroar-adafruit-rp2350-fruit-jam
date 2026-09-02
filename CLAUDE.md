@@ -50,10 +50,12 @@ power-rail integrity a live suspect rather than anything in the firmware.
   the timings showed why — 151 ms of SD against 15 ms of PSRAM, so every earlier fix had been
   aimed at the negligible half. The root cause was the SD clock's GPIO drive strength, an
   **electrical** variable no bus-level fix could ever have reached.
-- **Confirm a fix by reversal, AND for long enough.** FRUITJAM-97: 12 mA drops, 4 mA does not,
-  12 mA drops again — three arms, and still wrong, because each arm was only ~30 s and the fault
-  is episodic. Longer observation on the "good" build showed the drop. Reversal rules out luck
-  in one direction; it does nothing about a window too short to see the rate.
+- **A human watching an episodic fault is not an instrument (FRUITJAM-97).** Three arms of
+  eyeball A/B/A — 12 mA drops, 4 mA does not, 12 mA drops again — produced a change that
+  MEASUREMENT later showed more than DOUBLED the fault rate (5.54 vs 2.50 underruns per SD read,
+  ~55 trials per arm). Two same-config runs at n=19 gave 4.57 and 3.10, a 47% spread, so nothing
+  at that sample size was ever distinguishable. Reversal protects against luck in one direction;
+  it does nothing about a window too short to resolve a rate. Build a counter, then measure.
 - **An experiment the observer cannot read is not an experiment.** The same issue again: a
   four-phase bisect printed its phase markers to SERIAL while the fault was only visible on the
   SCREEN, so drops could not be attributed and two readings had to be thrown away. Either put
