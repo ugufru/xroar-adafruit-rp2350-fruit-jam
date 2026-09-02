@@ -761,9 +761,25 @@ static int pick_row_for_drive(int drive) {
     return (g_dsk_cur[drive] >= 0) ? g_dsk_cur[drive] : 0;
 }
 
+// FRUITJAM-97: instrument a mount. Default OFF — per CLAUDE.md serial load is
+// itself a variable, and this prints from the picker path.
+#ifndef COCO_MOUNT_PROBE
+#define COCO_MOUNT_PROBE 0
+#endif
+#if COCO_MOUNT_PROBE
+// Both counters are defined further down (with the deferred-resync machinery and
+// in pico_hdmi respectively); declared here so the mount path can sample them.
+extern volatile uint32_t g_resync_count;
+extern "C" volatile uint32_t video_output_resync_count;
+#endif
+
 static bool mount_dsk_index(int i, int drive, bool remember) {
     if (i < 0 || i >= g_dsk_count) return false;
     if ((unsigned)drive >= COCO_NDRIVE) return false;
+#if COCO_MOUNT_PROBE
+    uint32_t t_start = millis();
+    uint32_t r0 = g_resync_count, l0 = video_output_resync_count;
+#endif
     char path[48];
     snprintf(path, sizeof(path), "0:/coco/dsk/%s", g_dsk_names[i]);
     const uint8_t *img = nullptr;
@@ -782,6 +798,21 @@ static bool mount_dsk_index(int i, int drive, bool remember) {
     // " IN DRIVE d" is 11 of the panel's 32 columns, so the name gets 21 —
     // long names are truncated here rather than running off the row.
     snprintf(g_pick_msg, sizeof(g_pick_msg), "%.21s IN DRIVE %d", g_dsk_names[i], drive);
+
+#if COCO_MOUNT_PROBE
+    // FRUITJAM-97 discriminator. The question this answers is the ONLY one that
+    // matters next: does the firmware resync during a mount, or does the sink
+    // drop lock by itself?
+    //   both counters move  -> our resync path fired; the 1-2 s is OUR cost, and
+    //                          FRUITJAM-56's pin-parking is not doing its job
+    //   neither moves       -> the sink lost lock unaided, i.e. TMDS was corrupted
+    //                          and nothing in the firmware ever noticed
+    // Printed AFTER the load so the serial write cannot itself perturb it.
+    Serial.printf("[mount] %lu ms  resync %lu->%lu  lib %lu->%lu\n",
+                  (unsigned long)(millis() - t_start),
+                  (unsigned long)r0, (unsigned long)g_resync_count,
+                  (unsigned long)l0, (unsigned long)video_output_resync_count);
+#endif
     return true;
 }
 
@@ -1749,7 +1780,7 @@ extern "C" void tuh_hid_report_received_cb(uint8_t daddr, uint8_t idx,
 // Instead core 0 just requests a resync; core 1 performs it from its background
 // task, where disabling DMA_IRQ_1 actually holds off the local handler.
 static volatile bool     g_want_resync  = false;
-static volatile uint32_t g_resync_count = 0;
+volatile uint32_t g_resync_count = 0;
 
 static void core1_background(void) {
     video_output_compose_service();

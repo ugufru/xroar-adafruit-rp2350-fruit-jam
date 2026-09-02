@@ -23,8 +23,11 @@ repo, so the lineage stays auditable. See `THIRD_PARTY_LICENSES.md` for licenses
   `clk_hstx = 252/2 = 126 MHz` — the value FRUITJAM-03 measured. Upstream's
   default (`MODE_HSTX_CLK_DIV=1`) assumes a 126 MHz system clock, which we do not
   use (we run 252 MHz for PIO-USB + emulation).
-- **Local modifications:** one, in `src/video_output.c` and `src/video_output_rt.c`
-  (the same defect exists in both; only `video_output.c` is built). `hstx_resync()`
+- **Local modifications:** two, all in `src/video_output.c` (the first also in
+  `src/video_output_rt.c`, where the same defect exists; only `video_output.c` is
+  built).
+
+  **(1) RP2350-E5 in `hstx_resync()` (FRUITJAM-49).** `hstx_resync()`
   aborted the two mutually-chained HSTX DMA channels with the SDK's
   `dma_channel_abort()`, which does **not** implement the **RP2350-E5** workaround
   — `hardware/dma.h` documents that clearing the EN bit of the aborted channel and
@@ -36,7 +39,19 @@ repo, so the lineage stays auditable. See `THIRD_PARTY_LICENSES.md` for licenses
   at ~2.67x (160 fps at 60p) — i.e. the resync could *cause* the desync it exists
   to clear. Replaced with an explicit EN-clear / simultaneous-abort /
   EN-restore sequence. Upstream bug, reported against FRUITJAM-49; revisit on the
-  next vendor bump. All other integration lives in our own `src/display/`.
+  next vendor bump.
+
+  **(2) Pin parking across a resync (FRUITJAM-56).** `hstx_resync()` left the HSTX
+  GPIOs driven while HSTX was disabled and restarted, so the sink saw the TMDS
+  clock stop and restart mid-garbage and had to fully re-acquire — 0.5–2 s of black
+  on every resync. Now the pins are parked to `GPIO_FUNC_SIO` *before* HSTX is
+  disabled (step 2), and reconnected only after the first valid line has serialized
+  (step 8, `while (dma_channel_is_busy(DMACH_PING))`), so the sink's first exposure
+  after a restart is already well-formed TMDS. `video_output_rt.c` already did this
+  correctly and was the reference. *Recorded retrospectively 2026-09-02: this
+  landed in `34cea06` bundled into an unrelated roadmap commit and was missed here.*
+
+  All other integration lives in our own `src/display/`.
 
 ## lib/xroar_core — XRoar emulation core (CPU / SAM / PIA / VDG / events)
 
