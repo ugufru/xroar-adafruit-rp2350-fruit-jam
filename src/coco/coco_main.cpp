@@ -499,6 +499,10 @@ static size_t   g_dsk_len[COCO_NDRIVE] = { 0, 0, 0, 0 };
 // it was an unreachable row for the keyboard; the button path closes on the
 // 1+3 chord instead (see picker_task).
 #define PICK_COUNT        (g_dsk_count)
+// Visible list rows: 0 = title bar, 1-14 = list, 15 = status bar. Shared with
+// the key handler so PgUp/PgDn move by exactly one screen — if this and the
+// drawing disagreed, paging would silently skip or repeat rows.
+#define PICK_ROWS         14
 
 
 // FRUITJAM-81: write-back. The FDC reports each sector it writes; we record the
@@ -975,7 +979,7 @@ static void draw_picker(void) {
     const uint16_t hi  = g_pal[8];    // black      — text on the selected row
     const uint16_t bg  = g_pal[9];    // dark green — panel background
     const int      COLS = OVL_COLS;             // 32, the CoCo text width
-    const int      rows_visible = 14;   // rows 1-14; 0 = title, 15 = status
+    const int      rows_visible = PICK_ROWS;
 
     char line[OVL_COLS + 1];
     for (int i = 0; i < COLS; i++) line[i] = ' ';
@@ -996,7 +1000,9 @@ static void draw_picker(void) {
     char hdr[OVL_COLS + 1];
     // Title as a full-width bar. The key legends are gone: they cost two of
     // sixteen rows permanently to teach four keys once.
-    snprintf(hdr, sizeof(hdr), " DSK DRIVE ASSIGNMENTS");
+    // Starts at column 0, directly over the four drive columns, so it reads as
+    // a heading for them rather than as a floating panel title.
+    snprintf(hdr, sizeof(hdr), "DISK ASSIGNMENTS");
     for (size_t k = strlen(hdr); k < (size_t)COLS; k++) hdr[k] = ' ';
     hdr[COLS] = '\0';
     // Green on black: a recessed bar, which stays inside the CoCo green scheme
@@ -1044,7 +1050,7 @@ static void draw_picker(void) {
     // so the panel keeps a bar top and bottom instead of the list appearing to
     // change height as one comes and goes.
     char sts[OVL_COLS + 1];
-    snprintf(sts, sizeof(sts), " %s", g_pick_msg);
+    snprintf(sts, sizeof(sts), "%s", g_pick_msg);
     for (size_t k = strlen(sts); k < (size_t)COLS; k++) sts[k] = ' ';
     sts[COLS] = '\0';
     fb_text(0, 1 + rows_visible, sts, fg, hi);
@@ -1405,6 +1411,9 @@ static void hid_keyboard_apply(const uint8_t *report) {
         const bool k_f12 = newly(0x45), k_up = newly(0x52),
                    k_dn  = newly(0x51), k_ent = newly(0x28),
                    k_esc = newly(0x29), k_f11 = newly(0x44);
+        // HID: Home 0x4A, PgUp 0x4B, End 0x4D, PgDn 0x4E.
+        const bool k_home = newly(0x4A), k_pgup = newly(0x4B),
+                   k_end  = newly(0x4D), k_pgdn = newly(0x4E);
         // HID 0x1E-0x21 are '1'..'4'; 0x27 is '0'. Only read while the overlay
         // is open, so the digits stay ordinary typing the rest of the time.
         int k_drive = -1;
@@ -1494,6 +1503,19 @@ static void hid_keyboard_apply(const uint8_t *report) {
                 g_pick_sel += k_dn ? 1 : -1;
                 if (g_pick_sel < 0)           g_pick_sel = PICK_COUNT - 1;
                 if (g_pick_sel >= PICK_COUNT) g_pick_sel = 0;
+                g_pick_dirty = true;
+            }
+            // Home/End/PgUp/PgDn. These CLAMP rather than wrap, unlike Up/Down:
+            // wrapping a page jump makes it impossible to say where you will
+            // land, whereas Home and End are only useful if they are absolute.
+            // A page is exactly one screenful, so PgDn then PgUp returns you to
+            // the row you started on wherever the list is long enough.
+            if ((k_home || k_end || k_pgup || k_pgdn) && g_dsk_count) {
+                if      (k_home) g_pick_sel = 0;
+                else if (k_end)  g_pick_sel = PICK_COUNT - 1;
+                else             g_pick_sel += k_pgdn ? PICK_ROWS : -PICK_ROWS;
+                if (g_pick_sel < 0)           g_pick_sel = 0;
+                if (g_pick_sel >= PICK_COUNT) g_pick_sel = PICK_COUNT - 1;
                 g_pick_dirty = true;
             }
             // ENTER is deliberately inert: assignment is 0-3 and closing is
