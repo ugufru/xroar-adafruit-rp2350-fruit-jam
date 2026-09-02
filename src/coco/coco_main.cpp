@@ -2134,7 +2134,17 @@ void setup() {
 #define COCO_BISECT_GAP_US 0
 #endif
 #if COCO_MOUNT_BISECT && PICO_HDMI_FIFO_PROBE
-static uint32_t g_bisect_trials = 0, g_bisect_underruns = 0;
+// Counted IN FIRMWARE and reported cumulatively, because the loads under test
+// knock out the USB CDC link and per-trial lines get lost — the earlier attempt
+// kept only 7-13 of 55 trials. Cumulative counters survive a dropout.
+//
+// g_bisect_clean is the metric that actually matches the symptom: a mount either
+// visibly drops or it does not, so what matters is the FRACTION OF TRIALS WITH
+// ZERO UNDERRUNS, not the mean. The distributions are heavy-tailed (mostly 0-1
+// with occasional bursts of 13-29), so a mean measures outlier severity rather
+// than how often a mount survives.
+static uint32_t g_bisect_trials = 0, g_bisect_underruns = 0, g_bisect_clean = 0;
+static uint32_t g_bisect_worst  = 0;
 #endif
 #if COCO_MOUNT_BISECT
 static void mount_bisect_task(void) {
@@ -2199,6 +2209,8 @@ static void mount_bisect_task(void) {
             uint32_t d = hstx_fifo_underruns - ur0;
             g_bisect_trials++;
             g_bisect_underruns += d;
+            if (d == 0) g_bisect_clean++;
+            if (d > g_bisect_worst) g_bisect_worst = d;
             Serial.printf("[bisect] %s done in %lu ms, underruns +%lu\n",
                           bounce ? "D" : "C", (unsigned long)(millis() - t),
                           (unsigned long)d);
@@ -2399,11 +2411,12 @@ void RAM_FUNC loop() {
                 hstx_fifo_min_level = 0xFFFFFFFF;   // per-report minimum
 #if COCO_MOUNT_BISECT
                 if (g_bisect_trials && Serial.availableForWrite() >= 64)
-                    Serial.printf("  [arm] trials %lu  underruns %lu  mean %lu.%02lu/trial\n",
+                    Serial.printf("  [arm] trials %lu  CLEAN %lu (%lu%%)  underruns %lu  worst %lu\n",
                                   (unsigned long)g_bisect_trials,
+                                  (unsigned long)g_bisect_clean,
+                                  (unsigned long)(g_bisect_clean * 100 / g_bisect_trials),
                                   (unsigned long)g_bisect_underruns,
-                                  (unsigned long)(g_bisect_underruns / g_bisect_trials),
-                                  (unsigned long)((g_bisect_underruns * 100 / g_bisect_trials) % 100));
+                                  (unsigned long)g_bisect_worst);
 #endif
             }
 #endif

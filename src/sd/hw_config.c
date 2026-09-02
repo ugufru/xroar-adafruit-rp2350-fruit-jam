@@ -25,8 +25,17 @@ static spi_t g_sd_spi = {
 // FRUITJAM-97: both knobs are build-settable so measurement arms are one flag
 // each and can be flashed separately, per CLAUDE.md's rule about defining arms
 // in advance rather than segmenting one log.
+// 6.25 MHz, HALVED from the 12.5 MHz bring-up value. Measured with the FIFO
+// probe over ~80 trials per arm: clean mounts (zero TMDS underruns) go from 44%
+// to 65%, and the worst burst halves from 32 underruns to 14. z = 2.7, p ~ 0.007.
+// Costs 284 ms per image load against 153 ms.
+//
+// The metric is FRACTION OF MOUNTS WITH ZERO UNDERRUNS, not the mean, because
+// the symptom is binary — a mount either visibly drops or it does not — and the
+// distributions are heavy-tailed, so a mean measures outlier severity instead.
+// Set -DCOCO_SD_BAUD=12500000 to go back to the faster, worse setting.
 #ifndef COCO_SD_BAUD
-#define COCO_SD_BAUD 12500000
+#define COCO_SD_BAUD 6250000
 #endif
 // 12 mA, the ORIGINAL bring-up value. It was changed to 4 mA on 2026-09-02 on the
 // strength of an eyeball A/B/A, and that was WRONG: measured with the FIFO probe
