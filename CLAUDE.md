@@ -50,9 +50,18 @@ power-rail integrity a live suspect rather than anything in the firmware.
   the timings showed why — 151 ms of SD against 15 ms of PSRAM, so every earlier fix had been
   aimed at the negligible half. The root cause was the SD clock's GPIO drive strength, an
   **electrical** variable no bus-level fix could ever have reached.
-- **Confirm a fix by reversal, not by one good arm.** The same issue: 12 mA drops, 4 mA does
-  not, 12 mA drops again. Given how episodic this repo's faults are, a single quiet run proves
-  nothing — put the old value back and check the fault returns.
+- **Confirm a fix by reversal, AND for long enough.** FRUITJAM-97: 12 mA drops, 4 mA does not,
+  12 mA drops again — three arms, and still wrong, because each arm was only ~30 s and the fault
+  is episodic. Longer observation on the "good" build showed the drop. Reversal rules out luck
+  in one direction; it does nothing about a window too short to see the rate.
+- **An experiment the observer cannot read is not an experiment.** The same issue again: a
+  four-phase bisect printed its phase markers to SERIAL while the fault was only visible on the
+  SCREEN, so drops could not be attributed and two readings had to be thrown away. Either put
+  the label where the observer is looking, or run ONE arm per build so no attribution is needed.
+- **`PICO_HDMI_FIFO_PROBE=1` counts TMDS FIFO underruns directly** (HSTX_FIFO_STAT sampled in
+  the scanout ISR). Healthy `min_level` is 6-7; it hits 0 exactly when the picture breaks. Use
+  this rather than the desync watchdog for anything involving a starved FIFO — the watchdog
+  detects by frame rate and this fault does not change the frame rate.
 - **Short captures cannot see episodic faults.** Desyncs arrive in bursts; episode onset has ranged
   from 6 s to 4 min after boot. A 15 s capture proves nothing; a 3 min capture proves little.
 - **Use `scripts/serial_logger.py`** (wall-clock timestamps, survives reboots) and compare
@@ -83,7 +92,8 @@ power-rail integrity a live suspect rather than anything in the firmware.
 | `COCO_DSK_WRITEBACK` | 0 | Persist disk writes to SD. Off pending FRUITJAM-88. |
 | `COCO_JOY_PROBE` | 0 | Log raw HID gamepad reports. `1` to identify a new pad (FRUITJAM-18). |
 | `COCO_MOUNT_PROBE` | 0 | Log a disk mount's duration and both resync counters (FRUITJAM-97). |
-| `COCO_MOUNT_BISECT` | 0 | Alternate PSRAM-write-only / SD-read-only every 5 s, to isolate which half of a mount disturbs the video (FRUITJAM-97). |
+| `COCO_MOUNT_BISECT` | 0 | Run ONE load repeatedly every 5 s to isolate what disturbs the video: 1=PSRAM only, 2=SD→SRAM, 3=SD→PSRAM (a real mount), 4=SD→SRAM→PSRAM (FRUITJAM-97). |
+| `PICO_HDMI_FIFO_PROBE` | 0 | Count HSTX FIFO underruns in the scanout ISR. The only instrument that can see a starved-FIFO fault (FRUITJAM-97). |
 | `COCO_CROP_BORDER` | 0 | Crop the VDG border, scale 2.5x to fill 640x480 (FRUITJAM-61). |
 | `COCO_CROP_SMOOTH` | 2 | With the above: 0 hard, 1 linear, 2 boundary blend. |
 | `NEO_IDLE_CYCLE` | 0 | Idle colour cycle. Off — desyncs video, FRUITJAM-47. |

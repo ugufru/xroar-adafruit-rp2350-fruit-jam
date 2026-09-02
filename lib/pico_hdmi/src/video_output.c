@@ -650,12 +650,34 @@ static inline void __scratch_x("") video_output_handle_active_data(dma_channel_h
 // DMA IRQ Handler
 // ============================================================================
 
+#if PICO_HDMI_FIFO_PROBE
+// FRUITJAM-97: count TMDS FIFO underruns directly.
+//
+// This exists because the desync watchdog is structurally blind to the fault we
+// are chasing: it detects by FRAME RATE, and a starved FIFO corrupts TMDS
+// without changing the frame count, so the screen drops while every counter
+// reads normal. HSTX_FIFO_STAT gives the real signal — EMPTY during active
+// video IS the underrun. Sampling it once per scanline (~31.5 kHz) converts an
+// invisible fault into a countable one, so loads can be compared by RATE
+// instead of by a human watching a monitor.
+volatile uint32_t hstx_fifo_underruns = 0;
+volatile uint32_t hstx_fifo_min_level = 0xFFFFFFFF;
+#endif
+
 static void __scratch_x("") dma_irq_handler()
 {
     uint32_t ch_num = dma_pong ? DMACH_PONG : DMACH_PING;
     dma_channel_hw_t *ch = &dma_hw->ch[ch_num];
     dma_hw->intr = 1U << ch_num;
     dma_pong = !dma_pong;
+#if PICO_HDMI_FIFO_PROBE
+    {
+        uint32_t st = hstx_fifo_hw->stat;
+        if (st & HSTX_FIFO_STAT_EMPTY_BITS) hstx_fifo_underruns++;
+        uint32_t lvl = st & HSTX_FIFO_STAT_LEVEL_BITS;
+        if (lvl < hstx_fifo_min_level) hstx_fifo_min_level = lvl;
+    }
+#endif
 
     // Advance audio/data-island scheduler exactly once per scanline (HDMI
     // mode only). All 525 lines tick: audio packets must be spread across

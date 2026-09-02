@@ -2130,10 +2130,19 @@ void setup() {
 #ifndef COCO_MOUNT_BISECT
 #define COCO_MOUNT_BISECT 0
 #endif
+#ifndef COCO_BISECT_GAP_US
+#define COCO_BISECT_GAP_US 0
+#endif
 #if COCO_MOUNT_BISECT
 static void mount_bisect_task(void) {
+    // ONE PHASE PER BUILD. The four-phase cycling version was a bad experiment:
+    // the phase markers went to SERIAL while the fault is only visible on the
+    // SCREEN, so there was no way to attribute a drop to a phase and the readings
+    // it produced were worthless. COCO_MOUNT_BISECT now SELECTS the phase —
+    // 1=A, 2=B, 3=C, 4=D — and runs only that one, so the question is reduced to
+    // "did the picture drop during this build, yes or no".
     static uint32_t next_ms = 0;
-    static int      phase   = 0;
+    static int      phase   = (COCO_MOUNT_BISECT - 1) & 3;
     static uint8_t *pbuf    = nullptr;
     const size_t    SZ      = 161280;          // one standard 35-track image
     uint32_t now = millis();
@@ -2144,6 +2153,45 @@ static void mount_bisect_task(void) {
     if (!pbuf) pbuf = (uint8_t *)__psram_malloc(SZ);
     if (!pbuf) { Serial.println("[bisect] PSRAM alloc failed"); return; }
 
+    // Phase C is what a REAL mount does: SD read landing directly in PSRAM, so
+    // the SPI transfer and the QMI writes overlap. Phase D is the candidate fix —
+    // read into an SRAM bounce buffer, THEN copy to PSRAM, so the two never run
+    // at the same time. A and B each proved harmless on their own once the SD
+    // clock drive was fixed; if C drops and D does not, the fault is the OVERLAP.
+    if (phase >= 2) {
+        const bool bounce = (phase == 3);
+        Serial.printf("[bisect] %s: SD read %u B -> PSRAM%s\n",
+                      bounce ? "D" : "C", (unsigned)SZ,
+                      bounce ? " via SRAM bounce" : " DIRECT (= real mount)");
+        Serial.flush();
+        uint32_t t = millis();
+        static uint8_t bbuf[PSRAM_READ_CHUNK];
+        FIL f;
+        if (f_open(&f, g_dsk_path[0][0] ? g_dsk_path[0] : "0:/coco/dsk/AUTO.DSK", FA_READ) == FR_OK) {
+            UINT br = 0; size_t total = 0;
+            while (total < SZ) {
+                UINT want = (UINT)((SZ - total > PSRAM_READ_CHUNK) ? PSRAM_READ_CHUNK : SZ - total);
+                FRESULT rc = bounce ? f_read(&f, bbuf, want, &br)
+                                    : f_read(&f, pbuf + total, want, &br);
+                if (rc != FR_OK || br == 0) { f_lseek(&f, 0); continue; }
+                if (bounce) memcpy(pbuf + total, bbuf, br);
+                total += br;
+#if COCO_BISECT_GAP_US
+                // Re-test of the Saturday pacing experiment, which was run at
+                // 12 mA SCK when an SD read alone already dropped the link — it
+                // never got a fair trial. Now that SD-alone survives (phase B),
+                // a gap here lets the card idle between bursts.
+                delayMicroseconds(COCO_BISECT_GAP_US);
+#endif
+            }
+            f_close(&f);
+            Serial.printf("[bisect] %s done in %lu ms\n", bounce ? "D" : "C",
+                          (unsigned long)(millis() - t));
+        } else {
+            Serial.println("[bisect] no image to read");
+        }
+        return;
+    }
     if (phase == 0) {
         Serial.printf("[bisect] A: PSRAM write %u B, no SD\n", (unsigned)SZ);
         Serial.flush();
@@ -2174,7 +2222,6 @@ static void mount_bisect_task(void) {
             Serial.println("[bisect] B: no image to read");
         }
     }
-    phase ^= 1;
 }
 #endif
 
@@ -2320,6 +2367,19 @@ void RAM_FUNC loop() {
                               (unsigned long)video_output_precomposed_stale_count,
                               (unsigned long)hstx_di_queue_silence_count,
                               (unsigned long)video_output_resync_count);
+#if PICO_HDMI_FIFO_PROBE
+            {
+                extern volatile uint32_t hstx_fifo_underruns, hstx_fifo_min_level;
+                static uint32_t prev_ur = 0;
+                uint32_t ur = hstx_fifo_underruns;
+                if (Serial && Serial.availableForWrite() >= 64)
+                    Serial.printf("  [fifo] underruns %lu (+%lu)  min_level %lu\n",
+                                  (unsigned long)ur, (unsigned long)(ur - prev_ur),
+                                  (unsigned long)hstx_fifo_min_level);
+                prev_ur = ur;
+                hstx_fifo_min_level = 0xFFFFFFFF;   // per-report minimum
+            }
+#endif
         }
         // FRUITJAM-60: emulator liveness probe. A frozen SCREEN and a hung
         // emulator look identical from outside, and the fields/fps counters
