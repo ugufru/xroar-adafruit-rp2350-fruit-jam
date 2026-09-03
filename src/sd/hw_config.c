@@ -25,17 +25,21 @@ static spi_t g_sd_spi = {
 // FRUITJAM-97: both knobs are build-settable so measurement arms are one flag
 // each and can be flashed separately, per CLAUDE.md's rule about defining arms
 // in advance rather than segmenting one log.
-// 6.25 MHz, HALVED from the 12.5 MHz bring-up value. Measured with the FIFO
-// probe over ~80 trials per arm: clean mounts (zero TMDS underruns) go from 44%
-// to 65%, and the worst burst halves from 32 underruns to 14. z = 2.7, p ~ 0.007.
-// Costs 284 ms per image load against 153 ms.
+// 12.5 MHz, restored. It was halved to 6.25 MHz to mitigate FRUITJAM-97 — a
+// runtime image load corrupted TMDS, and the slower clock took clean mounts from
+// 44% to 65% (measured, ~80 trials per arm, z = 2.7).
 //
-// The metric is FRACTION OF MOUNTS WITH ZERO UNDERRUNS, not the mean, because
-// the symptom is binary — a mount either visibly drops or it does not — and the
-// distributions are heavy-tailed, so a mean measures outlier severity instead.
-// Set -DCOCO_SD_BAUD=12500000 to go back to the faster, worse setting.
+// FRUITJAM-79 made that mitigation unnecessary: images are now cached in PSRAM at
+// BOOT, before core 1 starts, so mounting does no SD I/O at all and there is no
+// runtime read left to slow down. The only cost the slower clock still carried
+// was boot time — the cache load is ~21 sequential image reads — so restoring the
+// faster clock buys that back at no risk. SD activity during setup() is provably
+// harmless: no video is being scanned out yet.
+//
+// If a future change reintroduces runtime SD reads with video live, halve this
+// again and re-measure with PICO_HDMI_FIFO_PROBE.
 #ifndef COCO_SD_BAUD
-#define COCO_SD_BAUD 6250000
+#define COCO_SD_BAUD 12500000
 #endif
 // 12 mA, the ORIGINAL bring-up value. It was changed to 4 mA on 2026-09-02 on the
 // strength of an eyeball A/B/A, and that was WRONG: measured with the FIFO probe

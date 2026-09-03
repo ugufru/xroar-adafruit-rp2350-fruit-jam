@@ -487,6 +487,33 @@ static size_t   g_dsk_len[COCO_NDRIVE] = { 0, 0, 0, 0 };
 // Which drive the overlay is currently assigning. Set from DSKREG when the
 // overlay opens, so it comes up on the drive the machine last addressed rather
 // than always on 0 — after a `DRIVE 1` + `DIR`, the overlay opens on drive 1.
+// FRUITJAM-79: PSRAM image cache, populated at BOOT.
+//
+// Every disk image the card holds (up to a PSRAM budget) is read once during
+// setup(), BEFORE multicore_launch_core1(). That timing is the whole point: no
+// video is being scanned out yet, so SD activity at boot is provably harmless —
+// it is why booting has never shown the fault that every runtime mount does.
+//
+// Mounting then becomes a POINTER ASSIGNMENT. No SD read, no flash write, no
+// copy: nothing that can disturb the HSTX link (FRUITJAM-97, where the best
+// tuned configuration still corrupted TMDS on 35% of mounts).
+//
+// The cached buffer is handed to the FDC directly rather than copied into a
+// per-drive working buffer. Writes therefore mutate the cache, which matches
+// existing behaviour: with COCO_DSK_WRITEBACK=0 changes are already session-only
+// and lost on power-down, and with it enabled they are flushed to the card
+// anyway. The one consequence worth naming is that mounting the SAME image in
+// two drives shares one buffer, so writes alias — a real drive cannot hold the
+// same physical disk twice, so this is an unreachable state in practice.
+//
+// Beyond the budget, mount_dsk_index falls back to the old SD read, with all of
+// FRUITJAM-97's cost. Budget is deliberately well under the 8 MB part.
+#define DSK_CACHE_BUDGET (6u * 1024u * 1024u)
+static uint8_t *g_dsk_cache[PICKER_MAX]     = { nullptr };
+static size_t   g_dsk_cache_len[PICKER_MAX] = { 0 };
+static int      g_dsk_cached_n   = 0;
+static size_t   g_dsk_cached_sz  = 0;
+
 // The overlay has NO "current drive" mode. It is one list of the card's disks,
 // and 0-3 assign the highlighted disk to that drive — pressing the digit a
 // second time unassigns it. That removes the modal state entirely: there is no
@@ -742,10 +769,13 @@ static void flush_dsk_writes(bool all) {
 // identically on every boot.
 // Empty a drive: free its image and tell the FDC there is no disk, so the drive
 // reports NOT READY exactly as an unassigned one does after a cold boot.
+static bool dsk_buf_is_cached(const uint8_t *p);   // defined with mount_dsk_index
+
 static void eject_drive(int drive, bool remember) {
     if ((unsigned)drive >= COCO_NDRIVE) return;
     flush_dsk_writes(true);                 // do not strand unwritten sectors
-    if (g_dsk_img[drive]) __psram_free(g_dsk_img[drive]);
+    if (g_dsk_img[drive] && !dsk_buf_is_cached(g_dsk_img[drive]))
+        __psram_free(g_dsk_img[drive]);
     g_dsk_img[drive]  = nullptr;
     g_dsk_len[drive]  = 0;
     g_dsk_cur[drive]  = -1;
@@ -773,12 +803,49 @@ extern volatile uint32_t g_resync_count;
 extern "C" volatile uint32_t video_output_resync_count;
 #endif
 
+// True when the buffer a drive holds belongs to the boot cache, and so must
+// never be freed on swap — the cache owns it for the life of the session.
+static bool dsk_buf_is_cached(const uint8_t *p) {
+    if (!p) return false;
+    for (int k = 0; k < g_dsk_count; k++) if (g_dsk_cache[k] == p) return true;
+    return false;
+}
+
 static bool mount_dsk_index(int i, int drive, bool remember) {
     if (i < 0 || i >= g_dsk_count) return false;
     if ((unsigned)drive >= COCO_NDRIVE) return false;
+
+    // FRUITJAM-79 fast path: the image is already in PSRAM from boot, so this
+    // is a pointer assignment and touches no I/O at all.
+    if (g_dsk_cache[i]) {
+        flush_dsk_writes(true);
+        if (g_dsk_img[drive] && !dsk_buf_is_cached(g_dsk_img[drive]))
+            __psram_free(g_dsk_img[drive]);
+        g_dsk_img[drive] = g_dsk_cache[i];
+        g_dsk_len[drive] = g_dsk_cache_len[i];
+        snprintf(g_dsk_path[drive], sizeof(g_dsk_path[drive]), "0:/coco/dsk/%s", g_dsk_names[i]);
+        g_dsk_cur[drive] = i;
+        coco_machine_mount_dsk_drive(drive, g_dsk_img[drive], g_dsk_len[drive]);
+        if (remember) save_dsk_assignments(g_dsk_names, g_dsk_cur, COCO_NDRIVE);
+        snprintf(g_pick_msg, sizeof(g_pick_msg), "%.21s IN DRIVE %d", g_dsk_names[i], drive);
+#if COCO_MOUNT_PROBE
+        Serial.printf("[mount] %lu ms  CACHED  underruns %lu\n",
+                      (unsigned long)(millis() - t_start),
+#if PICO_HDMI_FIFO_PROBE
+                      (unsigned long)(hstx_fifo_underruns - u0));
+#else
+                      0UL);
+#endif
+#endif
+        return true;
+    }
 #if COCO_MOUNT_PROBE
     uint32_t t_start = millis();
     uint32_t r0 = g_resync_count, l0 = video_output_resync_count;
+#if PICO_HDMI_FIFO_PROBE
+    extern volatile uint32_t hstx_fifo_underruns;
+    uint32_t u0 = hstx_fifo_underruns;
+#endif
 #endif
     char path[48];
     snprintf(path, sizeof(path), "0:/coco/dsk/%s", g_dsk_names[i]);
@@ -788,7 +855,8 @@ static bool mount_dsk_index(int i, int drive, bool remember) {
     // Flush BEFORE freeing: a swap abandons any unflushed sectors for the image
     // being replaced, and after the free its buffer is gone.
     flush_dsk_writes(true);
-    if (g_dsk_img[drive]) __psram_free(g_dsk_img[drive]);
+    if (g_dsk_img[drive] && !dsk_buf_is_cached(g_dsk_img[drive]))
+        __psram_free(g_dsk_img[drive]);
     g_dsk_img[drive] = (uint8_t *)img;
     g_dsk_len[drive] = len;
     snprintf(g_dsk_path[drive], sizeof(g_dsk_path[drive]), "%s", path);
@@ -808,10 +876,16 @@ static bool mount_dsk_index(int i, int drive, bool remember) {
     //   neither moves       -> the sink lost lock unaided, i.e. TMDS was corrupted
     //                          and nothing in the firmware ever noticed
     // Printed AFTER the load so the serial write cannot itself perturb it.
-    Serial.printf("[mount] %lu ms  resync %lu->%lu  lib %lu->%lu\n",
+    Serial.printf("[mount] %lu ms  resync %lu->%lu  lib %lu->%lu  UNDERRUNS %lu  %s\n",
                   (unsigned long)(millis() - t_start),
                   (unsigned long)r0, (unsigned long)g_resync_count,
-                  (unsigned long)l0, (unsigned long)video_output_resync_count);
+                  (unsigned long)l0, (unsigned long)video_output_resync_count,
+#if PICO_HDMI_FIFO_PROBE
+                  (unsigned long)(hstx_fifo_underruns - u0),
+#else
+                  0UL,
+#endif
+                  g_dsk_cache[i] ? "CACHED" : "sd-read");
 #endif
     return true;
 }
@@ -1935,6 +2009,33 @@ void setup() {
         // FRUITJAM-50: enumerate the card FIRST — resolving a remembered NAME
         // back to an index needs the list to exist.
         scan_dsk_dir();
+
+        // FRUITJAM-79: fill the PSRAM image cache. This runs BEFORE
+        // multicore_launch_core1(), so no video is being scanned out and the SD
+        // traffic cannot disturb the HSTX link — the reason boot has never shown
+        // the fault that every runtime mount does (FRUITJAM-97).
+        {
+            uint32_t t0 = millis();
+            for (int i = 0; i < g_dsk_count; i++) {
+                char path[48];
+                snprintf(path, sizeof(path), "0:/coco/dsk/%s", g_dsk_names[i]);
+                const uint8_t *img = nullptr;
+                size_t len = load_psram_file(path, &img);
+                if (!len) continue;                         // unreadable: leave uncached
+                if (g_dsk_cached_sz + len > DSK_CACHE_BUDGET) {
+                    __psram_free((void *)img);              // over budget: stop caching
+                    break;
+                }
+                g_dsk_cache[i]     = (uint8_t *)img;
+                g_dsk_cache_len[i] = len;
+                g_dsk_cached_sz   += len;
+                g_dsk_cached_n++;
+            }
+            Serial.printf("[dsk cache: %d/%d images, %u KB, %lu ms] ",
+                          g_dsk_cached_n, g_dsk_count,
+                          (unsigned)(g_dsk_cached_sz / 1024),
+                          (unsigned long)(millis() - t0));
+        }
 
         // FRUITJAM-71/78 precedence: the saved per-drive assignments, then
         // AUTO.DSK in drive 0, then coco.dsk. The user's most recent explicit
