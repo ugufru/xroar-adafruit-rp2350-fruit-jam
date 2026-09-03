@@ -67,7 +67,11 @@ power-rail integrity a live suspect rather than anything in the firmware.
 - **Short captures cannot see episodic faults.** Desyncs arrive in bursts; episode onset has ranged
   from 6 s to 4 min after boot. A 15 s capture proves nothing; a 3 min capture proves little.
 - **Use `scripts/serial_logger.py`** (wall-clock timestamps, survives reboots) and compare
-  **episodes per hour** between builds.
+  **episodes per hour** between builds. **Kill the previous logger first.** Two readers on one
+  port produce `device reports readiness to read but returned no data (device disconnected or
+  multiple access on port?)` — which reads exactly like the board dropping its USB link. Nine
+  accumulated loggers once had that misread as evidence that SD activity was disturbing the CDC
+  peripheral, and it went into two issues before the process list was checked.
 - **The resync counter is the discriminator.** It increments → the RP2350 lost the link. A dropout
   with the counter unchanged → the fault is downstream (cable, connector, sink re-acquiring).
 - **Code LAYOUT changes the desync rate by orders of magnitude (FRUITJAM-75).** Core 0's per-field
