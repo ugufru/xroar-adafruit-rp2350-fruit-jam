@@ -465,7 +465,14 @@ static void neo_idle_cycle(void) {
 // threw the long name away at scan time. 31 chars is what the 32-column overlay
 // can show beside the cursor and drive digit, and it keeps the mount path
 // ("0:/coco/dsk/" + name) inside g_dsk_path's 48 bytes.
-#define DSK_NAME_MAX 32          // 31 chars + NUL
+// 64, not 32. At 32 a name of exactly 31 characters was TRUNCATED, silently
+// eating the ".dsk" extension and leaving a path that could not be opened —
+// "Ugly Transforming Maze, The V10.dsk" on the test card became
+// "Ugly Transforming Maze, The V10" and that disk was unusable (FRUITJAM-103).
+// Truncation here is not a display concern, it corrupts the KEY used to open the
+// file and to match saved drive assignments. Names too long even for this are
+// now skipped explicitly at scan time rather than stored broken.
+#define DSK_NAME_MAX 64          // 63 chars + NUL
 #define DSK_NAME_COLS 27         // 32 cols - 5 for the "N -> " prefix
 
 // Defined further down (with the other SD loaders / the PSRAM allocator block);
@@ -550,7 +557,7 @@ static size_t   g_dsk_cached_sz  = 0;
 // alone cannot say which image they belong to, which is why the FDC callback
 // now reports the drive.
 #define DSKW_MAX 16
-static char     g_dsk_path[COCO_NDRIVE][48] = { "", "", "", "" };
+static char     g_dsk_path[COCO_NDRIVE][80] = { "", "", "", "" };
 static uint32_t g_dskw_off[COCO_NDRIVE][DSKW_MAX];
 static int      g_dskw_n[COCO_NDRIVE] = { 0, 0, 0, 0 };
 static bool     g_dskw_overflow[COCO_NDRIVE] = { false, false, false, false };
@@ -597,6 +604,12 @@ static void scan_dsk_dir(void) {
         if (fno.fname[0] == '.') continue;
         const char *ext = strrchr(fno.fname, '.');
         if (!ext || strcasecmp(ext, ".dsk") != 0) continue;
+        if (strlen(fno.fname) >= DSK_NAME_MAX) {
+            // Storing a truncated name would corrupt the path and the assignment
+            // key, so refuse it and say so rather than fail mysteriously later.
+            Serial.printf("[picker: SKIP over-long name %.40s...]\n", fno.fname);
+            continue;
+        }
         strncpy(g_dsk_names[g_dsk_count], fno.fname, DSK_NAME_MAX - 1);
         g_dsk_names[g_dsk_count][DSK_NAME_MAX - 1] = '\0';
         g_dsk_count++;
@@ -847,7 +860,7 @@ static bool mount_dsk_index(int i, int drive, bool remember) {
     uint32_t u0 = hstx_fifo_underruns;
 #endif
 #endif
-    char path[48];
+    char path[80];
     snprintf(path, sizeof(path), "0:/coco/dsk/%s", g_dsk_names[i]);
     const uint8_t *img = nullptr;
     size_t len = load_psram_file(path, &img);
@@ -2017,13 +2030,27 @@ void setup() {
         {
             uint32_t t0 = millis();
             for (int i = 0; i < g_dsk_count; i++) {
-                char path[48];
+                char path[80];
                 snprintf(path, sizeof(path), "0:/coco/dsk/%s", g_dsk_names[i]);
                 const uint8_t *img = nullptr;
                 size_t len = load_psram_file(path, &img);
-                if (!len) continue;                         // unreadable: leave uncached
+                if (!len) {
+                    // FRUITJAM-103: say WHICH image and why. Skipping silently
+                    // left one disk of 21 on the slow SD path with no way to tell
+                    // which — and that disk alone still drops the video link,
+                    // which is more confusing than a uniform failure.
+                    FILINFO fi;
+                    FRESULT rc = f_stat(path, &fi);
+                    Serial.printf("[dsk cache: SKIP %s — %s]\n", g_dsk_names[i],
+                                  rc != FR_OK      ? "stat failed"
+                                : fi.fsize == 0    ? "empty"
+                                : fi.fsize > (1u << 20) ? "over the 1 MB load cap"
+                                                   : "read failed");
+                    continue;
+                }
                 if (g_dsk_cached_sz + len > DSK_CACHE_BUDGET) {
                     __psram_free((void *)img);              // over budget: stop caching
+                    Serial.printf("[dsk cache: budget reached at %s]\n", g_dsk_names[i]);
                     break;
                 }
                 g_dsk_cache[i]     = (uint8_t *)img;
@@ -2357,6 +2384,28 @@ static void mount_bisect_task(void) {
 }
 #endif
 
+// FRUITJAM-56 verification. Its fix (park the HSTX pins before disabling, and
+// wait for a valid line before reconnecting) has been in video_output.c since
+// 34cea06, but the issue's completion condition — "a capture shows resync events
+// producing a brief flicker rather than a multi-second black" — was never
+// checked. Resyncs are episodic, so waiting for one is impractical; this forces
+// one every 10 s so the DURATION can simply be watched.
+#ifndef COCO_RESYNC_TEST
+#define COCO_RESYNC_TEST 0
+#endif
+#if COCO_RESYNC_TEST
+static void resync_test_task(void) {
+    static uint32_t next_ms = 0;
+    uint32_t now = millis();
+    if (now < 8000) return;
+    if (next_ms && now < next_ms) return;
+    next_ms = now + 10000;
+    Serial.printf("[resync-test] forcing resync at %lu ms\n", (unsigned long)now);
+    Serial.flush();
+    g_want_resync = true;      // core 1 performs it safely
+}
+#endif
+
 void RAM_FUNC loop() {
     static uint32_t deadline = 0;
     static uint32_t frames = 0, last_report = 0, run_us_acc = 0, blit_us_acc = 0;
@@ -2438,6 +2487,9 @@ void RAM_FUNC loop() {
     } else {
 #if COCO_MOUNT_BISECT
         mount_bisect_task();
+#endif
+#if COCO_RESYNC_TEST
+        resync_test_task();
 #endif
         coco_machine_run_cycles(CYCLES_PER_FRAME);
         coco_machine_render_frame();
