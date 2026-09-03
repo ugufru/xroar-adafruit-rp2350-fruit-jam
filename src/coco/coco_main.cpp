@@ -2393,6 +2393,9 @@ static void mount_bisect_task(void) {
 #ifndef COCO_RESYNC_TEST
 #define COCO_RESYNC_TEST 0
 #endif
+#ifndef COCO_NO_RESYNC
+#define COCO_NO_RESYNC 0
+#endif
 #if COCO_RESYNC_TEST
 static void resync_test_task(void) {
     static uint32_t next_ms = 0;
@@ -2667,7 +2670,18 @@ void RAM_FUNC loop() {
             // asynchronously from its background task, so without this the next
             // window or two would still measure the pre-resync rate and request
             // a second, redundant resync — each of which is another dropout.
+            // FRUITJAM-56/58 EXPERIMENT: COCO_NO_RESYNC=1 disables the watchdog
+            // entirely. Every resync costs ~1 s of black (measured), and the
+            // baseline desyncs it fires on show ZERO FIFO underruns — so it is
+            // worth knowing whether the link genuinely free-runs (watchdog
+            // needed) or whether the watchdog is firing on transients and
+            // blacking the screen for nothing. If the picture is FINE with this
+            // set, the cure has been worse than the disease.
+#if COCO_NO_RESYNC
+            if (false) {
+#else
             if (fps > 90 && (uint32_t)(now - dw_hold) >= 400) {
+#endif
                 g_want_resync = true;
                 dw_hold = now;
                 if (Serial && Serial.availableForWrite() >= 64)
