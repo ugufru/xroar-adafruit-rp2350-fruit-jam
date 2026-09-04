@@ -159,6 +159,8 @@ calculus in four ways — all now validated on hardware:
 - [`docs/display-hstx.md`](docs/display-hstx.md) — HSTX DVI scanout
 - [`docs/dual-core.md`](docs/dual-core.md) — core 0 / core 1 split (FRUITJAM-11)
 - [`docs/psram-policy.md`](docs/psram-policy.md) — PSRAM usage policy (FRUITJAM-08)
+- [`docs/audio-dac.md`](docs/audio-dac.md): TLV320DAC3100 audio codec, clocking, register
+  configuration, gain stages (FRUITJAM-07/13)
 - [`docs/perf-log.md`](docs/perf-log.md) — running performance record (FRUITJAM-15)
 
 ## License

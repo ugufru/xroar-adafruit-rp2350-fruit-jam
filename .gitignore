@@ -11,3 +11,6 @@ adafruit-fruit-jam.pdf
 # Serial capture logs from diagnostic runs (FRUITJAM-35)
 *.log
 docs/logs/
+
+# TI TLV320DAC3100 datasheet (SLAS671C) reference copy - see docs/audio-dac.md
+tlv320dac3100.pdf
